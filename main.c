@@ -1,6 +1,11 @@
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 enum {
   GGML_TYPE_F32     = 0,
@@ -90,11 +95,98 @@ typedef struct {
   uint64_t       offset;
   uint64_t       data_offset;
 
-  gguf_header    header;
+  uint64_t       n_kv;
+  uint64_t       n_tensors;
+  gguf_header   *header;
   gguf_kv       *kv;
   g4_tensor     *tensors;
 } gguf;
 
+static int read_bytes(gguf *g, void *dst, uint64_t n) {
+  // sanity check
+  if ((n > g->size) || (g->offset > g->size - n)) {
+    printf("Error: Seeking error");
+  }
+  memcpy(dst, (g->data + g->offset), n);
+  g->offset += n;
+  return 1;
+}
+
+static int read_u32(gguf *g, void *dst) { return read_bytes(g, dst, 4); }
+
+static int read_u64(gguf *g, void *dst) { return read_bytes(g, dst, 8); }
+
+static int read_str(gguf *g, gguf_str *dst) {
+  uint64_t len;
+  if (!read_u64(g, &len))
+    return 0;
+
+  dst->len = len;
+  dst->ptr = (const char *)g->data + g->offset;
+  g->offset += len;
+
+  return 1;
+}
+
+static void parse_kv(gguf *g) {
+  g->kv = calloc(g->n_kv, sizeof(gguf_kv));
+  if (!g->kv) {
+    fprintf(stderr, "Error: Failed to allocate memory for KV metadata\n");
+    return;
+  }
+
+  for (uint64_t i = 0; i < g->n_kv; i++) {
+    gguf_kv *kv = &g->kv[i];
+
+    if (!read_str(g, &kv->key))
+      return; // read the key
+    if (!read_u32(g, &kv->type))
+      return;
+
+    kv->raw = g->data + g->offset;
+    // TODO: skip the value size
+  }
+}
+static gguf *gguf_open(const char *model_dir) {
+  int fd = open(model_dir, O_RDONLY);
+  if (fd < 0) {
+    fprintf(stderr, "Error: Failed to open file\n");
+    return NULL;
+  }
+
+  struct stat sb;
+  if (fstat(fd, &sb) == -1) {
+    close(fd);
+    return NULL;
+  }
+
+  void *mapped = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (mapped == MAP_FAILED) {
+    fprintf(stderr, "Error: Memory mapping failed\n");
+    close(fd);
+    return NULL;
+  }
+
+  gguf *g = calloc(1, sizeof(*g));
+  if (!g) {
+    return NULL;
+  }
+
+  g->fd          = fd;
+  g->alignment   = 32;
+  g->data        = mapped;
+  g->header      = mapped;
+  g->offset      = sizeof(gguf_header);
+  g->data_offset = 0; // TODO:set later
+  g->size        = (uint64_t)sb.st_size;
+
+  g->n_kv      = g->header->n_kv;
+  g->n_tensors = g->header->n_tensors;
+
+  parse_kv(g);
+
+  return g;
+}
 typedef struct {
   const char *model_dir;
 } cli_config;
