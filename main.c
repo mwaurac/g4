@@ -112,6 +112,15 @@ static int read_bytes(gguf *g, void *dst, uint64_t n) {
   return 1;
 }
 
+static int skip_bytes(gguf *g, uint64_t n) {
+  // sanity check
+  if ((n > g->size) || (g->offset > g->size - n)) {
+    printf("Error: Seeking error");
+  }
+  g->offset += n;
+  return 1;
+}
+
 static int read_u32(gguf *g, void *dst) { return read_bytes(g, dst, 4); }
 
 static int read_u64(gguf *g, void *dst) { return read_bytes(g, dst, 8); }
@@ -126,6 +135,70 @@ static int read_str(gguf *g, gguf_str *dst) {
   g->offset += len;
 
   return 1;
+}
+
+static int scalar_value_size(uint32_t type) {
+  switch (type) {
+  case GGUF_VALUE_UINT8:
+  case GGUF_VALUE_INT8:
+  case GGUF_VALUE_BOOL:
+    return 1;
+  case GGUF_VALUE_UINT16:
+  case GGUF_VALUE_INT16:
+    return 2;
+  case GGUF_VALUE_UINT32:
+  case GGUF_VALUE_INT32:
+  case GGUF_VALUE_FLOAT32:
+    return 4;
+  case GGUF_VALUE_UINT64:
+  case GGUF_VALUE_INT64:
+  case GGUF_VALUE_FLOAT64:
+    return 8;
+  default:
+    return 0;
+  }
+}
+
+static int skip_value(gguf *g, uint32_t type, uint32_t depth) {
+  if (depth > 8) {
+    printf("Metadata nesting too deep\n");
+    return 0;
+  }
+
+  int scalar = scalar_value_size(type);
+  if (scalar != 0)
+    skip_bytes(g, scalar);
+  if (type == GGUF_VALUE_STRING) {
+    gguf_str skipped;
+    return read_str(g, &skipped);
+  }
+  if (type == GGUF_VALUE_ARRAY) {
+    uint64_t len;
+    uint32_t etype;
+
+    if (!read_u64(g, &len))
+      return 0;
+    if (!read_u32(g, &etype))
+      return 0;
+
+    uint64_t item_size = scalar_value_size(etype);
+    if (item_size != 0) {
+      if (len > UINT64_MAX / item_size) {
+        printf("Error: Metadata array is too large\n");
+        return 0;
+      }
+      return skip_bytes(g, item_size * len);
+    }
+
+    for (uint64_t i = 0; i < len; i++) {
+      if (!skip_value(g, etype, depth + 1))
+        return 0;
+    }
+    return 1;
+  }
+
+  printf("Error: Unknown metadata type");
+  return 0;
 }
 
 static void parse_kv(gguf *g) {
@@ -144,7 +217,8 @@ static void parse_kv(gguf *g) {
       return;
 
     kv->raw = g->data + g->offset;
-    // TODO: skip the value size
+    if (!skip_value(g, kv->type, 0))
+      return; // TODO: kill program
   }
 }
 static gguf *gguf_open(const char *model_dir) {
