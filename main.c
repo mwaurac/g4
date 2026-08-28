@@ -39,6 +39,50 @@ enum {
   GGML_TYPE_BF16    = 30,
   GGML_TYPE_COUNT
 };
+typedef struct {
+  const char *name;
+  uint32_t    block_elems;
+  uint32_t    block_bytes;
+} ggml_type_info;
+
+static const ggml_type_info ggml_types[] = {
+  [0]  = {"f32", 1, 4},
+  [1]  = {"f16", 1, 2},
+  [2]  = {"q4_0", 32, 18},
+  [3]  = {"q4_1", 32, 20},
+  [6]  = {"q5_0", 32, 22},
+  [7]  = {"q5_1", 32, 24},
+  [8]  = {"q8_0", 32, 34},
+  [9]  = {"q8_1", 32, 40},
+  [10] = {"q2_k", 256, 84},
+  [11] = {"q3_k", 256, 110},
+  [12] = {"q4_k", 256, 144},
+  [13] = {"q5_k", 256, 176},
+  [14] = {"q6_k", 256, 210},
+  [15] = {"q8_k", 256, 292},
+  [16] = {"iq2_xxs", 256, 66},
+  [17] = {"iq2_xs", 256, 74},
+  [18] = {"iq3_xxs", 256, 98},
+  [19] = {"iq1_s", 256, 110},
+  [20] = {"iq4_nl", 256, 50},
+  [21] = {"iq3_s", 256, 110},
+  [22] = {"iq2_s", 256, 82},
+  [23] = {"iq4_xs", 256, 136},
+  [24] = {"i8", 1, 1},
+  [25] = {"i16", 1, 2},
+  [26] = {"i32", 1, 4},
+  [27] = {"i64", 1, 8},
+  [28] = {"f64", 1, 8},
+  [29] = {"iq1_m", 256, 56},
+  [30] = {"bf16", 1, 2},
+};
+
+static const ggml_type_info *tensor_type(uint32_t type) {
+  uint32_t n = sizeof(ggml_types) / sizeof(ggml_types[0]);
+  if (type >= n || ggml_types[type].name == NULL)
+    return NULL;
+  return &ggml_types[type];
+}
 
 enum {
   GGUF_VALUE_UINT8   = 0,
@@ -74,9 +118,9 @@ typedef struct {
   uint64_t dim[MAX_DIMS];
   uint32_t type;
   uint64_t offset;
+  uint64_t abs_offset;
   uint64_t elements;
   uint64_t bytes;
-  uint8_t *data;
 } g4_tensor;
 
 typedef struct {
@@ -121,9 +165,13 @@ static int skip_bytes(gguf *g, uint64_t n) {
   return 1;
 }
 
-static int read_u32(gguf *g, void *dst) { return read_bytes(g, dst, 4); }
+static int read_u32(gguf *g, void *dst) {
+  return read_bytes(g, dst, 4);
+}
 
-static int read_u64(gguf *g, void *dst) { return read_bytes(g, dst, 8); }
+static int read_u64(gguf *g, void *dst) {
+  return read_bytes(g, dst, 8);
+}
 
 static int read_str(gguf *g, gguf_str *dst) {
   uint64_t len;
@@ -216,11 +264,84 @@ static void parse_kv(gguf *g) {
     if (!read_u32(g, &kv->type))
       return;
 
+    // TODO: read values alignment
     kv->raw = g->data + g->offset;
     if (!skip_value(g, kv->type, 0))
       return; // TODO: kill program
   }
 }
+
+static const char *tensor_type_name(uint32_t type) {
+  const ggml_type_info *info = tensor_type(type);
+  return info ? info->name : "unknown";
+}
+
+static int tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
+  const ggml_type_info *info = tensor_type(type);
+  if (!info || info->block_elems)
+    return 0;
+  uint64_t blocks = (elements + info->block_elems - 1) / info->block_elems;
+  if (blocks > UINT64_MAX / info->block_bytes)
+    return 0;
+  *bytes = blocks * info->block_bytes;
+  return 1;
+}
+
+uint64_t get_alignment_padding(uint64_t alignment, uint64_t offset) {
+  return (alignment - (offset % alignment)) % alignment;
+}
+
+static void parse_tensors(gguf *g) {
+  g->tensors = calloc(g->n_tensors, sizeof(g4_tensor));
+  if (g->tensors) {
+    fprintf(stderr, "Error: Failed to allocate memory for tensors");
+    return;
+  }
+
+  for (uint64_t i = 0; i < g->n_tensors; i++) {
+    g4_tensor *tensor = &g->tensors[i];
+
+    if (!read_str(g, &tensor->name))
+      return;
+    if (!read_u32(g, &tensor->ndims))
+      return;
+
+    if (tensor->ndims > MAX_DIMS || tensor->ndims == 0) {
+      fprintf(stderr, "Tensor has unexpected number of dims");
+    }
+
+    tensor->elements = 1;
+    for (uint64_t i = 0; i < tensor->ndims; i++) {
+      if (!read_u64(g, &tensor->dim[i]))
+        return;
+
+      tensor->elements *= tensor->dim[i];
+    }
+
+    if (!read_u32(g, &tensor->type))
+      return;
+    if (!read_u64(g, &tensor->offset))
+      return;
+
+    if (!tensor_nbytes(tensor->type, tensor->elements, &tensor->bytes)) {
+      fprintf(stderr, "Error: tensor has unsupported GGML type");
+    }
+  }
+
+  uint64_t padding = get_alignment_padding(g->alignment, g->offset);
+  g->data_offset   = g->offset + padding;
+
+  for (uint64_t i = 0; i < g->n_tensors; i++) {
+    g4_tensor *tensor = &g->tensors[i];
+
+    if (tensor->offset > UINT64_MAX - g->data_offset) {
+      fprintf(stderr, "Error: tensor relative offset overflows the data_offset");
+    }
+
+    tensor->abs_offset = g->data_offset + tensor->offset;
+  }
+}
+
 static gguf *gguf_open(const char *model_dir) {
   int fd = open(model_dir, O_RDONLY);
   if (fd < 0) {
@@ -251,13 +372,14 @@ static gguf *gguf_open(const char *model_dir) {
   g->data        = mapped;
   g->header      = mapped;
   g->offset      = sizeof(gguf_header);
-  g->data_offset = 0; // TODO:set later
+  g->data_offset = 0;
   g->size        = (uint64_t)sb.st_size;
 
   g->n_kv      = g->header->n_kv;
   g->n_tensors = g->header->n_tensors;
 
   parse_kv(g);
+  parse_tensors(g);
 
   return g;
 }
