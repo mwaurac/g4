@@ -150,6 +150,7 @@ static int read_bytes(gguf *g, void *dst, uint64_t n) {
   // sanity check
   if ((n > g->size) || (g->offset > g->size - n)) {
     printf("Error: Seeking error");
+    return 0;
   }
   memcpy(dst, (g->data + g->offset), n);
   g->offset += n;
@@ -160,6 +161,7 @@ static int skip_bytes(gguf *g, uint64_t n) {
   // sanity check
   if ((n > g->size) || (g->offset > g->size - n)) {
     printf("Error: Seeking error");
+    return 0;
   }
   g->offset += n;
   return 1;
@@ -291,7 +293,7 @@ static const char *tensor_type_name(uint32_t type) {
 
 static int tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
   const ggml_type_info *info = tensor_type(type);
-  if (!info || info->block_elems)
+  if (!info || info->block_elems == 0)
     return 0;
   uint64_t blocks = (elements + info->block_elems - 1) / info->block_elems;
   if (blocks > UINT64_MAX / info->block_bytes)
@@ -306,7 +308,7 @@ uint64_t get_alignment_padding(uint64_t alignment, uint64_t offset) {
 
 static void parse_tensors(gguf *g) {
   g->tensors = calloc(g->n_tensors, sizeof(g4_tensor));
-  if (g->tensors) {
+  if (!g->tensors) {
     fprintf(stderr, "Error: Failed to allocate memory for tensors");
     return;
   }
@@ -315,7 +317,7 @@ static void parse_tensors(gguf *g) {
     g4_tensor *tensor = &g->tensors[i];
 
     if (!read_str(g, &tensor->name))
-      return;
+      return; // TODO:kill program when fails
     if (!read_u32(g, &tensor->ndims))
       return;
 
