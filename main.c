@@ -249,6 +249,11 @@ static int skip_value(gguf *g, uint32_t type, uint32_t depth) {
   return 0;
 }
 
+static int streq(gguf_str *str, const char *s) {
+  int slen = strlen(s);
+  return (memcmp(str->ptr, s, slen) == 0 && slen == str->len);
+}
+
 static void parse_kv(gguf *g) {
   g->kv = calloc(g->n_kv, sizeof(gguf_kv));
   if (!g->kv) {
@@ -264,7 +269,15 @@ static void parse_kv(gguf *g) {
     if (!read_u32(g, &kv->type))
       return;
 
-    // TODO: read values alignment
+    if (streq(&kv->key, "general.alignment") && kv->type == GGUF_VALUE_UINT32) {
+      if (!read_u32(g, &g->alignment))
+        return;
+      if (g->alignment == 0) {
+        fprintf(stderr, "Error: alignment must be a power of 2\n");
+        g->alignment = 32; // bail out
+      }
+      continue; // already consumed the value, don't skip_value it too
+    }
     kv->raw = g->data + g->offset;
     if (!skip_value(g, kv->type, 0))
       return; // TODO: kill program
