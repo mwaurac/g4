@@ -13,3 +13,25 @@ AlignConsecutiveAssignments:
   Enabled: true
   AcrossEmptyLines: false
   AcrossComments: false
+
+BinPackArguments: false
+BinPackParameters: false
+AllowAllArgumentsOnNextLine: false
+AllowAllParametersOfDeclarationOnNextLine: false
+
+BinPackLongBracedList: false
+
+Cpp11BracedListStyle: true
+
+BreakBeforeBraces: Attach
+
+IndentWidth: 2
+ContinuationIndentWidth: 2
+
+SpacesInContainerLiterals: false
+
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
