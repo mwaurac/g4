@@ -146,43 +146,61 @@ typedef struct {
   g4_tensor     *tensors;
 } gguf;
 
-static int read_bytes(gguf *g, void *dst, uint64_t n) {
-  // sanity check
-  if ((n > g->size) || (g->offset > g->size - n)) {
-    printf("Error: Seeking error");
-    return 0;
-  }
-  memcpy(dst, (g->data + g->offset), n);
-  g->offset += n;
+typedef struct {
+  const uint8_t *base;
+  uint64_t       size;
+  uint64_t       offset;
+  char           error[256];
+} g4_cursor;
+
+static g4_cursor cursor_at(const gguf *g, const uint64_t offset) {
+  g4_cursor c = {
+    .base   = g->data,
+    .size   = g->size,
+    .offset = offset,
+    .error  = {0},
+  };
+  return c;
+}
+
+static int cursor_fail(g4_cursor *c, const char *msg) {
+  if (c->error[0] == '\0')
+    snprintf(c->error, sizeof(c->error), "%s", msg);
+  return 0;
+}
+
+static int cursor_read_bytes(g4_cursor *c, void *dst, uint64_t n) {
+  if (n > c->size || c->offset > c->size - n)
+    return cursor_fail(c, "read past end of file");
+  memcpy(dst, c->base + c->offset, n);
+  c->offset += n;
   return 1;
 }
 
-static int skip_bytes(gguf *g, uint64_t n) {
-  // sanity check
-  if ((n > g->size) || (g->offset > g->size - n)) {
-    printf("Error: Seeking error");
-    return 0;
-  }
-  g->offset += n;
+static int cursor_skip(g4_cursor *c, uint64_t n) {
+  if (n > c->size || c->offset > c->size - n)
+    return cursor_fail(c, "seek past end of file");
+  c->offset += n;
   return 1;
 }
 
-static int read_u32(gguf *g, void *dst) {
-  return read_bytes(g, dst, 4);
+static int cursor_u32(g4_cursor *c, uint32_t *dst) {
+  return cursor_read_bytes(c, dst, 4);
 }
 
-static int read_u64(gguf *g, void *dst) {
-  return read_bytes(g, dst, 8);
+static int cursor_u64(g4_cursor *c, uint64_t *dst) {
+  return cursor_read_bytes(c, dst, 8);
 }
 
-static int read_str(gguf *g, gguf_str *dst) {
+static int cursor_str(g4_cursor *c, gguf_str *dst) {
   uint64_t len;
-  if (!read_u64(g, &len))
+  if (!cursor_u64(c, &len))
     return 0;
-
+  if (len > c->size || c->offset > c->size - len)
+    return cursor_fail(c, "string extends past end of file");
   dst->len = len;
-  dst->ptr = (const char *)g->data + g->offset;
-  g->offset += len;
+  dst->ptr = (const char *)c->base + c->offset;
+  c->offset += len;
 
   return 1;
 }
@@ -209,81 +227,75 @@ static int scalar_value_size(uint32_t type) {
   }
 }
 
-static int skip_value(gguf *g, uint32_t type, uint32_t depth) {
-  if (depth > 8) {
-    printf("Metadata nesting too deep\n");
-    return 0;
-  }
+static int skip_value(g4_cursor *c, uint32_t type, uint32_t depth) {
+  if (depth > 8)
+    return cursor_fail(c, "metadata nesting too deep");
 
   int scalar = scalar_value_size(type);
   if (scalar != 0)
-    return skip_bytes(g, scalar);
+    return cursor_skip(c, (uint64_t)scalar);
   if (type == GGUF_VALUE_STRING) {
     gguf_str skipped;
-    return read_str(g, &skipped);
+    return cursor_str(c, &skipped);
   }
   if (type == GGUF_VALUE_ARRAY) {
     uint64_t len;
     uint32_t etype;
 
-    if (!read_u32(g, &etype))
+    if (!cursor_u32(c, &etype))
       return 0;
-    if (!read_u64(g, &len))
+    if (!cursor_u64(c, &len))
       return 0;
 
     uint64_t item_size = scalar_value_size(etype);
     if (item_size != 0) {
-      if (len > UINT64_MAX / item_size) {
-        printf("Error: Metadata array is too large\n");
-        return 0;
-      }
-      return skip_bytes(g, item_size * len);
+      if (len > UINT64_MAX / item_size)
+        return cursor_fail(c, "metadata array is too large");
+      return cursor_skip(c, item_size * len);
     }
 
     for (uint64_t i = 0; i < len; i++) {
-      if (!skip_value(g, etype, depth + 1))
+      if (!skip_value(c, etype, depth + 1))
         return 0;
     }
     return 1;
   }
 
-  printf("Error: Unknown metadata type");
-  return 0;
+  return cursor_fail(c, "unknown metadata type");
 }
 
-static int streq(gguf_str *str, const char *s) {
+static int streq(const gguf_str *str, const char *s) {
   uint64_t slen = strlen(s);
   return (memcmp(str->ptr, s, slen) == 0 && slen == str->len);
 }
 
-static void parse_kv(gguf *g) {
+static int parse_kv(gguf *g, g4_cursor *c) {
   g->kv = calloc(g->n_kv, sizeof(gguf_kv));
-  if (!g->kv) {
-    fprintf(stderr, "Error: Failed to allocate memory for KV metadata\n");
-    return;
-  }
+  if (!g->kv)
+    return cursor_fail(c, "failed to allocate KV metadata");
 
   for (uint64_t i = 0; i < g->n_kv; i++) {
     gguf_kv *kv = &g->kv[i];
 
-    if (!read_str(g, &kv->key))
-      return; // read the key
-    if (!read_u32(g, &kv->type))
-      return;
+    if (!cursor_str(c, &kv->key))
+      return 0;
+    if (!cursor_u32(c, &kv->type))
+      return 0;
 
     if (streq(&kv->key, "general.alignment") && kv->type == GGUF_VALUE_UINT32) {
-      if (!read_u32(g, &g->alignment))
-        return;
+      if (!cursor_u32(c, &g->alignment))
+        return 0;
       if (g->alignment == 0) {
         fprintf(stderr, "Error: alignment must be a power of 2\n");
         g->alignment = 32; // bail out
       }
       continue; // already consumed the value, don't skip_value it too
     }
-    kv->val_pos = g->offset;
-    if (!skip_value(g, kv->type, 0))
-      return; // TODO: kill program
+    kv->val_pos = c->offset;
+    if (!skip_value(c, kv->type, 0))
+      return 0;
   }
+  return 1;
 }
 
 static const char *tensor_type_name(uint32_t type) {
@@ -302,59 +314,73 @@ static int tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
   return 1;
 }
 
-uint64_t get_alignment_padding(uint64_t alignment, uint64_t offset) {
+static uint64_t get_alignment_padding(uint64_t alignment, uint64_t offset) {
   return (alignment - (offset % alignment)) % alignment;
 }
 
-static void parse_tensors(gguf *g) {
+static int parse_tensors(gguf *g, g4_cursor *c) {
   g->tensors = calloc(g->n_tensors, sizeof(g4_tensor));
-  if (!g->tensors) {
-    fprintf(stderr, "Error: Failed to allocate memory for tensors");
-    return;
-  }
+  if (!g->tensors)
+    return cursor_fail(c, "failed to allocate tensors");
 
   for (uint64_t i = 0; i < g->n_tensors; i++) {
     g4_tensor *tensor = &g->tensors[i];
 
-    if (!read_str(g, &tensor->name))
-      return; // TODO:kill program when fails
-    if (!read_u32(g, &tensor->ndims))
-      return;
+    if (!cursor_str(c, &tensor->name))
+      return 0;
+    if (!cursor_u32(c, &tensor->ndims))
+      return 0;
 
-    if (tensor->ndims > MAX_DIMS || tensor->ndims == 0) {
-      fprintf(stderr, "Tensor has unexpected number of dims%u\n", tensor->ndims);
-    }
+    if (tensor->ndims > MAX_DIMS || tensor->ndims == 0)
+      return cursor_fail(c, "tensor has unexpected number of dims");
 
     tensor->elements = 1;
-    for (uint64_t i = 0; i < tensor->ndims; i++) {
-      if (!read_u64(g, &tensor->dim[i]))
-        return;
+    for (uint32_t d = 0; d < tensor->ndims; d++) {
+      if (!cursor_u64(c, &tensor->dim[d]))
+        return 0;
+      if (tensor->dim[d] != 0 && tensor->elements > UINT64_MAX / tensor->dim[d])
+        return cursor_fail(c, "tensor element count overflows");
 
-      tensor->elements *= tensor->dim[i];
+      tensor->elements *= tensor->dim[d];
     }
 
-    if (!read_u32(g, &tensor->type))
-      return;
-    if (!read_u64(g, &tensor->offset))
-      return;
+    if (!cursor_u32(c, &tensor->type))
+      return 0;
+    if (!cursor_u64(c, &tensor->offset))
+      return 0;
 
     if (!tensor_nbytes(tensor->type, tensor->elements, &tensor->bytes)) {
-      fprintf(stderr, "Error: tensor has unsupported GGML type");
+      snprintf(c->error, sizeof(c->error), "tensor has unsupported GGML type %s", tensor_type_name(tensor->type));
+      return 0;
     }
   }
 
-  uint64_t padding = get_alignment_padding(g->alignment, g->offset);
-  g->data_offset   = g->offset + padding;
+  uint64_t padding = get_alignment_padding(g->alignment, c->offset);
+  g->data_offset   = c->offset + padding;
 
   for (uint64_t i = 0; i < g->n_tensors; i++) {
     g4_tensor *tensor = &g->tensors[i];
 
-    if (tensor->offset > UINT64_MAX - g->data_offset) {
-      fprintf(stderr, "Error: tensor relative offset overflows the data_offset");
-    }
+    if (tensor->offset > UINT64_MAX - g->data_offset)
+      return cursor_fail(c, "tensor relative offset overflows data_offset");
 
     tensor->abs_offset = g->data_offset + tensor->offset;
   }
+  return 1;
+}
+
+static void gguf_close(gguf *g) {
+  if (!g)
+    return;
+  free(g->tensors);
+  free(g->kv);
+  if (g->data)
+    munmap((void *)g->data, g->size);
+  if (g->fd >= 0)
+    close(g->fd);
+  memset(g, 0, sizeof(*g));
+  g->fd = -1;
+  free(g);
 }
 
 static gguf *gguf_open(const char *model_dir) {
@@ -379,6 +405,8 @@ static gguf *gguf_open(const char *model_dir) {
 
   gguf *g = calloc(1, sizeof(*g));
   if (!g) {
+    munmap(mapped, sb.st_size);
+    close(fd);
     return NULL;
   }
 
@@ -386,31 +414,50 @@ static gguf *gguf_open(const char *model_dir) {
   g->alignment   = 32;
   g->data        = mapped;
   g->header      = mapped;
-  g->offset      = sizeof(gguf_header);
   g->data_offset = 0;
   g->size        = (uint64_t)sb.st_size;
 
   g->n_kv      = g->header->n_kv;
   g->n_tensors = g->header->n_tensors;
 
-  parse_kv(g);
-  parse_tensors(g);
+  g4_cursor c = cursor_at(g, sizeof(gguf_header));
+  if (!parse_kv(g, &c)) {
+    fprintf(stderr, "Error: %s\n", c.error[0] ? c.error : "failed to parse GGUF metadata");
+    gguf_close(g);
+    return NULL;
+  }
+
+  if (!parse_tensors(g, &c)) {
+    fprintf(stderr, "Error: %s\n", c.error[0] ? c.error : "failed to parse GGUF tensors");
+    gguf_close(g);
+    return NULL;
+  }
 
   return g;
 }
 
-static void gguf_close(gguf *g) {
-  if (!g)
-    return;
-  free(g->tensors);
-  free(g->kv);
-  if (g->data)
-    munmap((void *)g->data, g->size);
-  if (g->fd >= 0)
-    close(g->fd);
-  memset(g, 0, sizeof(*g));
-  g->fd = -1;
-  free(g);
+static gguf_kv *find_kv(const gguf *g, const char *key) {
+  for (uint64_t i = 0; i < g->n_kv; i++) {
+    if (streq(&g->kv[i].key, key))
+      return &g->kv[i];
+  }
+  return NULL;
+}
+
+static int read_kv_u32(const gguf *g, const char *key, uint32_t *out) {
+  gguf_kv *kv = find_kv(g, key);
+  if (!kv || kv->type != GGUF_VALUE_UINT32)
+    return 0;
+  g4_cursor c = cursor_at(g, kv->val_pos);
+  return cursor_u32(&c, out);
+}
+
+static int read_kv_str(const gguf *g, const char *key, gguf_str *out) {
+  gguf_kv *kv = find_kv(g, key);
+  if (!kv || kv->type != GGUF_VALUE_STRING)
+    return 0;
+  g4_cursor c = cursor_at(g, kv->val_pos);
+  return cursor_str(&c, out);
 }
 
 static int g4_load(const char *model_dir) {
@@ -419,6 +466,14 @@ static int g4_load(const char *model_dir) {
     fprintf(stderr, "Error: Failed to open GGUF file\n");
     return 0;
   }
+
+  gguf_str arch;
+  if (!read_kv_str(g, "general.architecture", &arch) || arch.len == 0) {
+    fprintf(stderr, "Error: missing general.architecture\n");
+    gguf_close(g);
+    return 0;
+  }
+
   // TODO: load the model configs then the tensors
   gguf_close(g);
   return 1;
@@ -436,6 +491,8 @@ static void usage() {
 }
 
 static int init_cfg(int argc, char *argv[], cli_config *cfg) {
+  *cfg = (cli_config){0};
+
   for (int i = 1; i < argc; i++) {
     const char *arg = argv[i];
 
@@ -453,6 +510,11 @@ static int init_cfg(int argc, char *argv[], cli_config *cfg) {
       return 0;
     }
   }
+
+  if (!cfg->model_dir) {
+    fprintf(stderr, "Error: -m is required\n");
+    return 0;
+  }
   return 1;
 }
 int main(int argc, char *argv[]) {
@@ -464,8 +526,8 @@ int main(int argc, char *argv[]) {
   }
 
   if (!g4_load(cfg.model_dir)) {
-    printf("Error");
-    exit(1);
+    fprintf(stderr, "Error: failed to load model\n");
+    return 1;
   }
   return 0;
 }
