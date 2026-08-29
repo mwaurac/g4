@@ -106,9 +106,9 @@ typedef struct {
 } gguf_str;
 
 typedef struct {
-  gguf_str       key;
-  uint32_t       type;
-  const uint8_t *raw;
+  gguf_str key;
+  uint32_t type;
+  uint64_t val_pos;
 } gguf_kv;
 
 #define MAX_DIMS 4
@@ -126,8 +126,8 @@ typedef struct {
 typedef struct {
   uint32_t magic;
   uint32_t version;
-  uint64_t n_kv;
   uint64_t n_tensors;
+  uint64_t n_kv;
 } gguf_header;
 
 typedef struct {
@@ -217,7 +217,7 @@ static int skip_value(gguf *g, uint32_t type, uint32_t depth) {
 
   int scalar = scalar_value_size(type);
   if (scalar != 0)
-    skip_bytes(g, scalar);
+    return skip_bytes(g, scalar);
   if (type == GGUF_VALUE_STRING) {
     gguf_str skipped;
     return read_str(g, &skipped);
@@ -226,9 +226,9 @@ static int skip_value(gguf *g, uint32_t type, uint32_t depth) {
     uint64_t len;
     uint32_t etype;
 
-    if (!read_u64(g, &len))
-      return 0;
     if (!read_u32(g, &etype))
+      return 0;
+    if (!read_u64(g, &len))
       return 0;
 
     uint64_t item_size = scalar_value_size(etype);
@@ -252,7 +252,7 @@ static int skip_value(gguf *g, uint32_t type, uint32_t depth) {
 }
 
 static int streq(gguf_str *str, const char *s) {
-  int slen = strlen(s);
+  uint64_t slen = strlen(s);
   return (memcmp(str->ptr, s, slen) == 0 && slen == str->len);
 }
 
@@ -280,7 +280,7 @@ static void parse_kv(gguf *g) {
       }
       continue; // already consumed the value, don't skip_value it too
     }
-    kv->raw = g->data + g->offset;
+    kv->val_pos = g->offset;
     if (!skip_value(g, kv->type, 0))
       return; // TODO: kill program
   }
@@ -322,7 +322,7 @@ static void parse_tensors(gguf *g) {
       return;
 
     if (tensor->ndims > MAX_DIMS || tensor->ndims == 0) {
-      fprintf(stderr, "Tensor has unexpected number of dims");
+      fprintf(stderr, "Tensor has unexpected number of dims%u\n", tensor->ndims);
     }
 
     tensor->elements = 1;
@@ -410,6 +410,18 @@ static void gguf_close(gguf *g) {
     close(g->fd);
   memset(g, 0, sizeof(*g));
   g->fd = -1;
+  free(g);
+}
+
+static int g4_load(const char *model_dir) {
+  gguf *g = gguf_open(model_dir);
+  if (!g) {
+    fprintf(stderr, "Error: Failed to open GGUF file\n");
+    return 0;
+  }
+  // TODO: load the model configs then the tensors
+  gguf_close(g);
+  return 1;
 }
 
 typedef struct {
@@ -425,17 +437,20 @@ static void usage() {
 
 static int init_cfg(int argc, char *argv[], cli_config *cfg) {
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
+    const char *arg = argv[i];
+
+    if (strcmp(arg, "-m") == 0 || strcmp(arg, "--model") == 0) {
       if (++i >= argc) {
         fprintf(stderr, "Error: -m requires an argument\n");
         return 0;
       }
       cfg->model_dir = argv[i];
-    }
-    if (strcmp(argv[1], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-      return 0;
+    } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+      usage();
+      exit(0);
     } else {
       fprintf(stderr, "Error: Unknown option\n");
+      return 0;
     }
   }
   return 1;
@@ -446,6 +461,11 @@ int main(int argc, char *argv[]) {
   if (!init_cfg(argc, argv, &cfg)) {
     usage();
     return 1;
+  }
+
+  if (!g4_load(cfg.model_dir)) {
+    printf("Error");
+    exit(1);
   }
   return 0;
 }
