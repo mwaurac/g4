@@ -398,6 +398,20 @@ static gguf *gguf_open(const char *model_dir) {
 
   return g;
 }
+
+static void gguf_close(gguf *g) {
+  if (!g)
+    return;
+  free(g->tensors);
+  free(g->kv);
+  if (g->data)
+    munmap((void *)g->data, g->size);
+  if (g->fd >= 0)
+    close(g->fd);
+  memset(g, 0, sizeof(*g));
+  g->fd = -1;
+}
+
 typedef struct {
   const char *model_dir;
 } cli_config;
