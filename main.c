@@ -7,6 +7,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#define G4_VOCAB_SIZE 262144
+#define G4_ROPE_THETA_SLIDING 10000.0f
+#define G4_ROPE_THETA_GLOBAL 1000000.0f
+#define G4_FINAL_LOGIT_SOFTCAPPING 30.0f
+#define G4_RMS_NORM_EPS 1.0e-6f
+#define G4_PARTIAL_ROTARY_FACTOR 0.25f
+
 enum {
   GGML_TYPE_F32     = 0,
   GGML_TYPE_F16     = 1,
@@ -459,6 +466,109 @@ static int read_kv_str(const gguf *g, const char *key, gguf_str *out) {
   g4_cursor c = cursor_at(g, kv->val_pos);
   return cursor_str(&c, out);
 }
+
+typedef struct {
+  const char *name;
+  uint32_t    context_length;
+  uint32_t    num_hidden_layers;   // block_count
+  uint32_t    hidden_size;         // embedding_length
+  uint32_t    intermediate_size;   // feed_forward_length
+  uint32_t    num_attention_heads; // head_count
+  uint32_t    num_key_value_heads; // head_count_kv
+  uint32_t    head_dim;            // key_length_swa + value_length_swa
+  uint32_t    sliding_window;
+  uint32_t    num_global_key_value_heads;
+  uint32_t    global_head_dim;      // key_length
+  uint32_t    num_kv_shared_layers; // shared_kv_layers
+  uint32_t    use_double_wide_mlp;
+
+  // for the e2b and e4b variant
+  uint32_t    hidden_size_per_layer_input; // embedding_length_per_layer_input
+
+  // For the 26B variant
+  uint32_t    num_experts;   // expert_count
+  uint32_t    top_k_experts; // expert_used_count
+  uint32_t    expert_intermediate_size;
+} g4_config;
+
+static const g4_config E2B_CONFIG = {
+  .name                        = "Gemma-4-E2B-It",
+  .context_length              = 131072,
+  .num_hidden_layers           = 35,
+  .hidden_size                 = 1536,
+  .intermediate_size           = 6144,
+  .num_attention_heads         = 8,
+  .num_key_value_heads         = 1,
+  .head_dim                    = 256,
+  .sliding_window              = 512,
+  .num_global_key_value_heads  = 0,
+  .global_head_dim             = 512,
+  .num_kv_shared_layers        = 20,
+  .hidden_size_per_layer_input = 256,
+  .use_double_wide_mlp         = 1,
+  .num_experts                 = 0,
+  .top_k_experts               = 0,
+  .expert_intermediate_size    = 0,
+};
+
+static const g4_config E4B_CONFIG = {
+  .name                        = "Gemma-4-E4B-It",
+  .context_length              = 131072,
+  .num_hidden_layers           = 42,
+  .hidden_size                 = 2560,
+  .intermediate_size           = 10240,
+  .num_attention_heads         = 8,
+  .num_key_value_heads         = 2,
+  .head_dim                    = 256,
+  .sliding_window              = 512,
+  .num_global_key_value_heads  = 0,
+  .global_head_dim             = 512,
+  .num_kv_shared_layers        = 18,
+  .use_double_wide_mlp         = 0,
+  .hidden_size_per_layer_input = 256,
+  .num_experts                 = 0,
+  .top_k_experts               = 0,
+  .expert_intermediate_size    = 0,
+};
+
+static const g4_config G4_26B_CONFIG = {
+  .name                        = "Gemma-4-26B-A4B-It",
+  .context_length              = 262144,
+  .num_hidden_layers           = 30,
+  .hidden_size                 = 2816,
+  .intermediate_size           = 2112,
+  .num_attention_heads         = 16,
+  .num_key_value_heads         = 8,
+  .head_dim                    = 256,
+  .sliding_window              = 1024,
+  .num_global_key_value_heads  = 2,
+  .global_head_dim             = 512,
+  .num_kv_shared_layers        = 0,
+  .use_double_wide_mlp         = 0,
+  .hidden_size_per_layer_input = 0,
+  .num_experts                 = 128,
+  .top_k_experts               = 8,
+  .expert_intermediate_size    = 704,
+};
+
+static const g4_config G4_31b_CONFIG = {
+  .name                        = "Gemma-4-31B-It",
+  .context_length              = 262144,
+  .num_hidden_layers           = 60,
+  .intermediate_size           = 21504,
+  .num_attention_heads         = 32,
+  .num_key_value_heads         = 16,
+  .head_dim                    = 256,
+  .sliding_window              = 1024,
+  .num_global_key_value_heads  = 4,
+  .global_head_dim             = 512,
+  .num_kv_shared_layers        = 0,
+  .use_double_wide_mlp         = 0,
+  .hidden_size_per_layer_input = 0,
+  .num_experts                 = 0,
+  .top_k_experts               = 0,
+  .expert_intermediate_size    = 0,
+};
 
 static int g4_load(const char *model_dir) {
   gguf *g = gguf_open(model_dir);
