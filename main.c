@@ -467,6 +467,15 @@ static int read_kv_str(const gguf *g, const char *key, gguf_str *out) {
   return cursor_str(&c, out);
 }
 
+static uint32_t required_kv_u32(const gguf *g, const char *key) {
+  uint32_t v = 0;
+  if (!read_kv_u32(g, key, &v)) {
+    fprintf(stderr, "Error: missing required GGUF key: %s\n", key);
+    exit(1);
+  }
+  return v;
+}
+
 typedef struct {
   const char *name;
   uint32_t    context_length;
@@ -491,84 +500,133 @@ typedef struct {
   uint32_t    expert_intermediate_size;
 } g4_config;
 
-static const g4_config E2B_CONFIG = {
-  .name                        = "Gemma-4-E2B-It",
-  .context_length              = 131072,
-  .num_hidden_layers           = 35,
-  .hidden_size                 = 1536,
-  .intermediate_size           = 6144,
-  .num_attention_heads         = 8,
-  .num_key_value_heads         = 1,
-  .head_dim                    = 256,
-  .sliding_window              = 512,
-  .num_global_key_value_heads  = 0,
-  .global_head_dim             = 512,
-  .num_kv_shared_layers        = 20,
-  .hidden_size_per_layer_input = 256,
-  .use_double_wide_mlp         = 1,
-  .num_experts                 = 0,
-  .top_k_experts               = 0,
-  .expert_intermediate_size    = 0,
+typedef enum {
+  G4_E2B             = 0,
+  G4_E4B             = 1,
+  G4_26B             = 2,
+  G4_31B             = 3,
+  G4_VARIANT_COUNT   = 4,
+  G4_VARIANT_INVALID = -1,
+} g4_variant;
+
+static const g4_config G4_CONFIGS[G4_VARIANT_COUNT] = {
+  {
+    .name                        = "Gemma-4-E2B-It",
+    .context_length              = 131072,
+    .num_hidden_layers           = 35,
+    .hidden_size                 = 1536,
+    .intermediate_size           = 6144,
+    .num_attention_heads         = 8,
+    .num_key_value_heads         = 1,
+    .head_dim                    = 256,
+    .sliding_window              = 512,
+    .num_global_key_value_heads  = 0,
+    .global_head_dim             = 512,
+    .num_kv_shared_layers        = 20,
+    .hidden_size_per_layer_input = 256,
+    .use_double_wide_mlp         = 1,
+    .num_experts                 = 0,
+    .top_k_experts               = 0,
+    .expert_intermediate_size    = 0,
+  },
+
+  {
+    .name                        = "Gemma-4-E4B-It",
+    .context_length              = 131072,
+    .num_hidden_layers           = 42,
+    .hidden_size                 = 2560,
+    .intermediate_size           = 10240,
+    .num_attention_heads         = 8,
+    .num_key_value_heads         = 2,
+    .head_dim                    = 256,
+    .sliding_window              = 512,
+    .num_global_key_value_heads  = 0,
+    .global_head_dim             = 512,
+    .num_kv_shared_layers        = 18,
+    .use_double_wide_mlp         = 0,
+    .hidden_size_per_layer_input = 256,
+    .num_experts                 = 0,
+    .top_k_experts               = 0,
+    .expert_intermediate_size    = 0,
+  },
+
+  {
+    .name                        = "Gemma-4-26B-A4B-It",
+    .context_length              = 262144,
+    .num_hidden_layers           = 30,
+    .hidden_size                 = 2816,
+    .intermediate_size           = 2112,
+    .num_attention_heads         = 16,
+    .num_key_value_heads         = 8,
+    .head_dim                    = 256,
+    .sliding_window              = 1024,
+    .num_global_key_value_heads  = 2,
+    .global_head_dim             = 512,
+    .num_kv_shared_layers        = 0,
+    .use_double_wide_mlp         = 0,
+    .hidden_size_per_layer_input = 0,
+    .num_experts                 = 128,
+    .top_k_experts               = 8,
+    .expert_intermediate_size    = 704,
+  },
+
+  {
+    .name                        = "Gemma-4-31B-It",
+    .context_length              = 262144,
+    .num_hidden_layers           = 60,
+    .intermediate_size           = 21504,
+    .num_attention_heads         = 32,
+    .num_key_value_heads         = 16,
+    .head_dim                    = 256,
+    .sliding_window              = 1024,
+    .num_global_key_value_heads  = 4,
+    .global_head_dim             = 512,
+    .num_kv_shared_layers        = 0,
+    .use_double_wide_mlp         = 0,
+    .hidden_size_per_layer_input = 0,
+    .num_experts                 = 0,
+    .top_k_experts               = 0,
+    .expert_intermediate_size    = 0,
+  },
 };
 
-static const g4_config E4B_CONFIG = {
-  .name                        = "Gemma-4-E4B-It",
-  .context_length              = 131072,
-  .num_hidden_layers           = 42,
-  .hidden_size                 = 2560,
-  .intermediate_size           = 10240,
-  .num_attention_heads         = 8,
-  .num_key_value_heads         = 2,
-  .head_dim                    = 256,
-  .sliding_window              = 512,
-  .num_global_key_value_heads  = 0,
-  .global_head_dim             = 512,
-  .num_kv_shared_layers        = 18,
-  .use_double_wide_mlp         = 0,
-  .hidden_size_per_layer_input = 256,
-  .num_experts                 = 0,
-  .top_k_experts               = 0,
-  .expert_intermediate_size    = 0,
-};
+static g4_variant identify_model(const gguf *g) {
+  gguf_str basename;
 
-static const g4_config G4_26B_CONFIG = {
-  .name                        = "Gemma-4-26B-A4B-It",
-  .context_length              = 262144,
-  .num_hidden_layers           = 30,
-  .hidden_size                 = 2816,
-  .intermediate_size           = 2112,
-  .num_attention_heads         = 16,
-  .num_key_value_heads         = 8,
-  .head_dim                    = 256,
-  .sliding_window              = 1024,
-  .num_global_key_value_heads  = 2,
-  .global_head_dim             = 512,
-  .num_kv_shared_layers        = 0,
-  .use_double_wide_mlp         = 0,
-  .hidden_size_per_layer_input = 0,
-  .num_experts                 = 128,
-  .top_k_experts               = 8,
-  .expert_intermediate_size    = 704,
-};
+  if (read_kv_str(g, "general.basename", &basename)) {
+    if (streq(&basename, "Gemma-4-E2B-It"))
+      return G4_E2B;
 
-static const g4_config G4_31b_CONFIG = {
-  .name                        = "Gemma-4-31B-It",
-  .context_length              = 262144,
-  .num_hidden_layers           = 60,
-  .intermediate_size           = 21504,
-  .num_attention_heads         = 32,
-  .num_key_value_heads         = 16,
-  .head_dim                    = 256,
-  .sliding_window              = 1024,
-  .num_global_key_value_heads  = 4,
-  .global_head_dim             = 512,
-  .num_kv_shared_layers        = 0,
-  .use_double_wide_mlp         = 0,
-  .hidden_size_per_layer_input = 0,
-  .num_experts                 = 0,
-  .top_k_experts               = 0,
-  .expert_intermediate_size    = 0,
-};
+    if (streq(&basename, "Gemma-4-E4B-It"))
+      return G4_E4B;
+
+    if (streq(&basename, "Gemma-4-26B-A4B-It"))
+      return G4_26B;
+
+    if (streq(&basename, "Gemma-4-31B-It"))
+      return G4_31B;
+  }
+
+  return G4_VARIANT_INVALID;
+}
+
+static uint32_t g4_validate_config(const gguf *g, const g4_config *cfg) {
+  uint32_t block_count = required_kv_u32(g, "gemma4.block_count");
+  uint32_t hidden_size = required_kv_u32(g, "gemma4.embedding_length");
+
+  // TODO: more checks
+  if (block_count != cfg->num_hidden_layers) {
+    fprintf(stderr, "Error: block count mismatch: GGUF=%u config=%u\n", block_count, cfg->num_hidden_layers);
+    return 0;
+  }
+
+  if (hidden_size != cfg->hidden_size) {
+    fprintf(stderr, "Error: hidden size mismatch: GGUF=%u config=%u\n", hidden_size, cfg->hidden_size);
+    return 0;
+  }
+
+  return 1;
+}
 
 static int g4_load(const char *model_dir) {
   gguf *g = gguf_open(model_dir);
@@ -584,7 +642,23 @@ static int g4_load(const char *model_dir) {
     return 0;
   }
 
-  // TODO: load the model configs then the tensors
+  g4_variant variant = identify_model(g);
+
+  if (variant == G4_VARIANT_INVALID) {
+    fprintf(stderr, "Error: unsupported Gemma 4 model\n");
+    gguf_close(g);
+    return 0;
+  }
+
+  const g4_config *cfg = &G4_CONFIGS[variant];
+
+  if (!g4_validate_config(g, cfg)) {
+    fprintf(stderr, "Error: GGUF does not match expected config\n");
+    gguf_close(g);
+    return 0;
+  }
+  // TODO: bind the tensors
+
   gguf_close(g);
   return 1;
 }
