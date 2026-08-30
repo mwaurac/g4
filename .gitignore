@@ -53,3 +53,8 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+*.gguf
+
+build/
+.idea/
