@@ -451,6 +451,14 @@ static gguf_kv *find_kv(const gguf *g, const char *key) {
   return NULL;
 }
 
+static g4_tensor *find_tensor(const gguf *g, const char *t_name) {
+  for (uint64_t i = 0; i < g->n_tensors; i++) {
+    if (streq(&g->tensors[i].name, t_name))
+      return &g->tensors[i];
+  }
+  return NULL;
+}
+
 static int read_kv_u32(const gguf *g, const char *key, uint32_t *out) {
   gguf_kv *kv = find_kv(g, key);
   if (!kv || kv->type != GGUF_VALUE_UINT32)
@@ -474,6 +482,15 @@ static uint32_t required_kv_u32(const gguf *g, const char *key) {
     exit(1);
   }
   return v;
+}
+
+static g4_tensor *required_tensor(const gguf *g, const char *t_name) {
+  g4_tensor *t = find_tensor(g, t_name);
+  if (!t) {
+    fprintf(stderr, "Error: missing required tensor: %s\n", t_name);
+    exit(1);
+  }
+  return t;
 }
 
 typedef struct {
@@ -590,6 +607,143 @@ static const g4_config G4_CONFIGS[G4_VARIANT_COUNT] = {
   },
 };
 
+typedef struct {
+  g4_tensor *attn_norm;
+  g4_tensor *attn_q;
+  g4_tensor *attn_k;
+  g4_tensor *attn_v;
+  g4_tensor *attn_out;
+
+  g4_tensor *attn_q_norm;
+  g4_tensor *attn_k_norm;
+  g4_tensor *attn_post_norm;
+  g4_tensor *out_scale;
+  g4_tensor *rope_freqs;
+
+  g4_tensor *ffn_norm;
+  g4_tensor *ffn_gate;
+  g4_tensor *ffn_up;
+  g4_tensor *ffn_down;
+  g4_tensor *ffn_post_norm;
+
+  g4_tensor *ffn_gate_inp;
+  g4_tensor *ffn_gate_inp_s;
+  g4_tensor *ffn_pre_norm_2;
+  g4_tensor *ffn_post_norm_1;
+  g4_tensor *ffn_post_norm_2;
+
+  g4_tensor *ffn_gate_up_exps;
+  g4_tensor *ffn_gate_exps;
+  g4_tensor *ffn_up_exps;
+  g4_tensor *ffn_down_exps;
+
+  g4_tensor *ple_inp_gate;
+  g4_tensor *ple_proj;
+  g4_tensor *ple_post_norm;
+} g4_layer;
+
+typedef struct {
+  g4_tensor *token_embd;
+  g4_tensor *output;
+  g4_tensor *output_norm;
+
+  g4_tensor *per_layer_token_embd;
+  g4_tensor *per_layer_model_proj;
+  g4_tensor *per_layer_proj_norm;
+
+  g4_layer  *layers;
+} g4_weights;
+
+static g4_tensor *blk(const gguf *g, int il, const char *suffix) {
+  char name[96];
+  snprintf(name, sizeof(name), "blk.%d.%s", il, suffix);
+  return find_tensor(g, name);
+}
+
+static g4_tensor *blk_r(const gguf *g, int il, const char *suffix) {
+  char name[96];
+  snprintf(name, sizeof(name), "blk.%d.%s", il, suffix);
+  return required_tensor(g, name);
+}
+
+static void bind_layer_weights(const g4_config *cfg, const gguf *g, g4_layer *layer, uint32_t il) {
+  layer->attn_norm      = blk_r(g, il, "attn_norm.weight");
+  layer->attn_q         = blk_r(g, il, "attn_q.weight");
+  layer->attn_out       = blk_r(g, il, "attn_output.weight");
+  layer->attn_q_norm    = blk_r(g, il, "attn_q_norm.weight");
+  layer->attn_post_norm = blk_r(g, il, "post_attention_norm.weight");
+  layer->ffn_norm       = blk_r(g, il, "ffn_norm.weight");
+  layer->ffn_gate       = blk_r(g, il, "ffn_gate.weight");
+  layer->ffn_up         = blk_r(g, il, "ffn_up.weight");
+  layer->ffn_down       = blk_r(g, il, "ffn_down.weight");
+  layer->ffn_post_norm  = blk_r(g, il, "post_ffw_norm.weight");
+  layer->out_scale      = blk(g, il, "layer_output_scale.weight"); // optional
+
+  // TODO: Conditional require these tensors. Are required only on tensors ownig the kv cache
+  // FIXME:
+  layer->attn_k      = blk_r(g, il, "attn_k.weight");
+  layer->attn_k_norm = blk_r(g, il, "attn_k_norm.weight");
+  layer->attn_v      = blk_r(g, il, "attn_v.weight");
+
+  // TODO: rope_freqs is required only in global attn layers only
+  // FIXME:
+  layer->rope_freqs = required_tensor(g, "rope_freqs.weight");
+
+  // OPTIONAL WEIGHTS ie Variant specific
+  // MOE
+  layer->ffn_gate_inp = blk(g, il, "ffn_gate_inp.weight");
+  if (layer->ffn_gate_inp != NULL) {
+    layer->ffn_gate_inp_s   = blk_r(g, il, "ffn_gate_inp.scale");
+    layer->ffn_pre_norm_2   = blk_r(g, il, "pre_ffw_norm_2.weight");
+    layer->ffn_post_norm_1  = blk_r(g, il, "post_ffw_norm_1.weight");
+    layer->ffn_post_norm_2  = blk_r(g, il, "post_ffw_norm_2.weight");
+    layer->ffn_gate_up_exps = blk(g, il, "ffn_gate_up_exps.weight");
+
+    if (layer->ffn_gate_up_exps == NULL) {
+      layer->ffn_gate_exps    = blk_r(g, il, "ffn_gate_exps.weight");
+      layer->ffn_gate_up_exps = blk_r(g, il, "ffn_up_exps.weight");
+    }
+    layer->ffn_down_exps = blk_r(g, il, "ffn_down_exps.weight");
+  }
+
+  // PLE
+  if (cfg->hidden_size_per_layer_input > 0) {
+    layer->ple_inp_gate  = blk_r(g, il, "inp_gate.weight");
+    layer->ple_proj      = blk_r(g, il, "proj.weight");
+    layer->ple_post_norm = blk_r(g, il, "post_norm.weight");
+  }
+}
+
+static void bind_weights(const g4_config *cfg, const gguf *g) {
+  g4_weights *weights = calloc(1, sizeof(*weights));
+  if (!weights) {
+    fprintf(stderr, "Error: failed to allocate mem\n");
+    exit(1);
+  }
+
+  weights->token_embd  = required_tensor(g, "token_embd.weight");
+  weights->output      = find_tensor(g, "output.weight");
+  weights->output_norm = required_tensor(g, "output_norm.weight");
+  if (!weights->output)
+    weights->output = weights->token_embd; // tie weights
+
+  if (cfg->hidden_size_per_layer_input > 0) {
+    weights->per_layer_token_embd = find_tensor(g, "per_layer_token_embd.weight");
+    weights->per_layer_model_proj = find_tensor(g, "per_layer_model_proj.weight");
+    weights->per_layer_proj_norm  = find_tensor(g, "per_layer_proj_norm.weight");
+  }
+
+  weights->layers = calloc(cfg->num_hidden_layers, sizeof(g4_layer));
+  if (!weights->layers) {
+    fprintf(stderr, "Error: Failed to allocate mem for layers\n");
+    exit(1);
+  }
+
+  for (uint32_t i = 0; i < cfg->num_hidden_layers; i++) {
+    bind_layer_weights(cfg, g, &weights->layers[i], i);
+  }
+}
+
 static g4_variant identify_model(const gguf *g) {
   gguf_str basename;
 
@@ -659,6 +813,7 @@ static int g4_load(const char *model_dir) {
   }
   // TODO: bind the tensors
 
+  bind_weights(cfg, g);
   gguf_close(g);
   return 1;
 }
