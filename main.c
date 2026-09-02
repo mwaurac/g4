@@ -782,6 +782,44 @@ static uint32_t g4_validate_config(const gguf *g, const g4_config *cfg) {
   return 1;
 }
 
+// followind on the instruction at https://ai.google.dev/gemma/docs/core/prompt-formatting-gemma4
+typedef struct {
+  uint32_t vocab_size;
+
+  uint32_t bos_token_id;
+  uint32_t eos_token_id;
+  uint32_t unk_token_id;
+
+  uint32_t system_token_id;     // "system"
+  uint32_t user_token_id;       // "user"
+  uint32_t model_token_id;      // "model"
+  uint32_t turn_start_token_id; // <|turn>
+  uint32_t turn_end_token_id;   // <turn|>
+
+  uint32_t think_token_id;         // <|think|>
+  uint32_t channel_start_token_id; //<|channel>
+  uint32_t channel_end_token_id;   // <channel|>
+
+  uint32_t tool_start_token_id;          // <|tool>
+  uint32_t tool_end_token_id;            // <tool|>
+  uint32_t tool_call_start_token_id;     // <|tool_call>
+  uint32_t tool_call_end_token_id;       // <tool_call|>
+  uint32_t tool_response_start_token_id; // <|tool_response>
+  uint32_t tool_response_end_token_id;   // <tool_response|>
+
+  uint32_t string_delimiter_token_id; // <|"|>
+
+  uint32_t image_start_token_id; //<|image>
+  uint32_t image_end_token_id;   //<image|>
+  uint32_t audio_start_token_id; // <|audio>
+  uint32_t audio_end_token_id;   // <audio|>
+  uint32_t image_placeholer_id;  // <|image|>
+  uint32_t audio_placeholder_id; // <|audio|>
+} g4_tokenizer;
+
+static g4_tokenizer load_tokenizer(gguf *g) {
+  return NULL;
+}
 static int g4_load(const char *model_dir) {
   gguf *g = gguf_open(model_dir);
   if (!g) {
@@ -811,21 +849,25 @@ static int g4_load(const char *model_dir) {
     gguf_close(g);
     return 0;
   }
-  // TODO: bind the tensors
 
   bind_weights(cfg, g);
+
+  // TODO: Load tokenizer
+  load_tokenizer(g);
   gguf_close(g);
   return 1;
 }
 
 typedef struct {
   const char *model_dir;
+  const char *prompt;
 } cli_config;
 
 static void usage() {
   fprintf(stderr, "Gemma4 E2B Inference\n");
   fprintf(stderr, "Options:\n\n");
   fprintf(stderr, "-m, --model <path>     Path to the model directory\n");
+  fprintf(stderr, "-p, --prompt <TEXT>    Text prompt to feed to the model for a single shot response\n");
   fprintf(stderr, "-h, --help             Show this help message\n");
 }
 
@@ -841,6 +883,12 @@ static int init_cfg(int argc, char *argv[], cli_config *cfg) {
         return 0;
       }
       cfg->model_dir = argv[i];
+    } else if (strcmp(arg, "-p") == 0 || strcmp(arg, "--prompt") == 0) {
+      if (++i >= argc) {
+        fprintf(stderr, "Error: -p requires an argument\n");
+        return 0;
+      }
+      cfg->prompt = argv[i];
     } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
       usage();
       exit(0);
