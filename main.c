@@ -1,4 +1,6 @@
 #include <fcntl.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +15,19 @@
 #define G4_FINAL_LOGIT_SOFTCAPPING 30.0f
 #define G4_RMS_NORM_EPS 1.0e-6f
 #define G4_PARTIAL_ROTARY_FACTOR 0.25f
+
+// TODO: replace most areas with die
+static void g4_die(const char *msg) {
+  fprintf(stderr, "Error: %s\n", msg);
+  exit(1);
+}
+
+static void *xcalloc(size_t n, size_t size) {
+  void *p = calloc(n, size);
+  if (!p)
+    g4_die("out of memory");
+  return p;
+}
 
 enum {
   GGML_TYPE_F32     = 0,
@@ -111,6 +126,12 @@ typedef struct {
   uint64_t    len;
   const char *ptr;
 } gguf_str;
+
+typedef struct {
+  uint32_t etype;
+  uint64_t len;
+  uint64_t data_pos;
+} gguf_array;
 
 typedef struct {
   gguf_str key;
@@ -274,6 +295,10 @@ static int skip_value(g4_cursor *c, uint32_t type, uint32_t depth) {
 static int streq(const gguf_str *str, const char *s) {
   uint64_t slen = strlen(s);
   return (memcmp(str->ptr, s, slen) == 0 && slen == str->len);
+}
+
+static int gstr_cmp(const gguf_str *a, const gguf_str *b) {
+  return a->len == b->len && memcmp(a->ptr, b->ptr, a->len) == 0;
 }
 
 static int parse_kv(gguf *g, g4_cursor *c) {
@@ -473,6 +498,21 @@ static int read_kv_str(const gguf *g, const char *key, gguf_str *out) {
     return 0;
   g4_cursor c = cursor_at(g, kv->val_pos);
   return cursor_str(&c, out);
+}
+
+static int read_kv_array(const gguf *g, const char *key, gguf_array *out) {
+  gguf_kv *kv = find_kv(g, key);
+  if (!kv || kv->type != GGUF_VALUE_ARRAY)
+    return 0;
+
+  g4_cursor c = cursor_at(g, kv->val_pos);
+  if (!cursor_u32(&c, &out->etype))
+    return 0;
+  if (!cursor_u64(&c, &out->len))
+    return 0;
+
+  out->data_pos = c.offset;
+  return 1;
 }
 
 static uint32_t required_kv_u32(const gguf *g, const char *key) {
@@ -782,43 +822,201 @@ static uint32_t g4_validate_config(const gguf *g, const g4_config *cfg) {
   return 1;
 }
 
+typedef struct {
+  gguf_str key;
+  int32_t  value;
+  bool     used;
+} str_i32_entry;
+
+typedef struct {
+  str_i32_entry *entries;
+  uint64_t       capacity;
+  uint64_t       len;
+} str_i32_table;
+
+static uint64_t next_pow2(uint64_t n) {
+  uint64_t p = 1;
+  while (p < n)
+    p <<= 1;
+  return p;
+}
+
+static void table_init(str_i32_table *t, uint64_t expected_size) {
+  t->capacity = next_pow2(expected_size * 2 + 16);
+  t->len      = 0;
+  t->entries  = xcalloc((size_t)t->capacity, sizeof(str_i32_entry));
+}
+
+static void table_free(str_i32_table *t) {
+  free(t->entries);
+  memset(t, 0, sizeof(*t));
+}
+
+static uint64_t hash_bytes(const void *ptr, uint64_t len) {
+  const uint8_t *p = ptr;
+  uint64_t       h = 1469598103934665603ull;
+  for (uint64_t i = 0; i < len; i++) {
+    h ^= p[i];
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+// linear probing
+static void table_put(str_i32_table *t, gguf_str key, int32_t value) {
+  uint64_t mask = t->capacity - 1;
+  uint64_t i    = hash_bytes(key.ptr, key.len) & mask;
+
+  while (t->entries[i].used) {
+    if (gstr_cmp(&t->entries[i].key, &key)) {
+      t->entries[i].value = value;
+      return;
+    }
+    i = (i + 1) & mask;
+  }
+
+  t->entries[i].used  = true;
+  t->entries[i].key   = key;
+  t->entries[i].value = value;
+  t->len++;
+}
+
+static bool table_get(const str_i32_table *t, const char *ptr, uint64_t len, int *value) {
+  if (t->capacity == 0)
+    return false;
+
+  uint64_t mask = t->capacity - 1;
+  uint64_t i    = hash_bytes(ptr, len) & mask;
+
+  while (t->entries[i].used) {
+    gguf_str key = t->entries[i].key;
+    if (key.len == len && memcmp(key.ptr, ptr, len) == 0) {
+      *value = t->entries[i].value;
+      return true;
+    }
+    i = (i + 1) & mask;
+  }
+  return false;
+}
+
 // followind on the instruction at https://ai.google.dev/gemma/docs/core/prompt-formatting-gemma4
 typedef struct {
-  uint32_t vocab_size;
+  gguf_str     *tokens;
+  str_i32_table merge_rank;
+  str_i32_table token_to_id;
+  uint32_t      vocab_size;
 
-  uint32_t bos_token_id;
-  uint32_t eos_token_id;
-  uint32_t unk_token_id;
+  uint32_t      bos_token_id;
+  uint32_t      eos_token_id;
+  uint32_t      unk_token_id;
 
-  uint32_t system_token_id;     // "system"
-  uint32_t user_token_id;       // "user"
-  uint32_t model_token_id;      // "model"
-  uint32_t turn_start_token_id; // <|turn>
-  uint32_t turn_end_token_id;   // <turn|>
+  uint32_t      system_token_id;     // "system"
+  uint32_t      user_token_id;       // "user"
+  uint32_t      model_token_id;      // "model"
+  uint32_t      turn_start_token_id; // <|turn>
+  uint32_t      turn_end_token_id;   // <turn|>
 
-  uint32_t think_token_id;         // <|think|>
-  uint32_t channel_start_token_id; //<|channel>
-  uint32_t channel_end_token_id;   // <channel|>
+  uint32_t      think_token_id;         // <|think|>
+  uint32_t      channel_start_token_id; //<|channel>
+  uint32_t      channel_end_token_id;   // <channel|>
 
-  uint32_t tool_start_token_id;          // <|tool>
-  uint32_t tool_end_token_id;            // <tool|>
-  uint32_t tool_call_start_token_id;     // <|tool_call>
-  uint32_t tool_call_end_token_id;       // <tool_call|>
-  uint32_t tool_response_start_token_id; // <|tool_response>
-  uint32_t tool_response_end_token_id;   // <tool_response|>
+  uint32_t      tool_start_token_id;          // <|tool>
+  uint32_t      tool_end_token_id;            // <tool|>
+  uint32_t      tool_call_start_token_id;     // <|tool_call>
+  uint32_t      tool_call_end_token_id;       // <tool_call|>
+  uint32_t      tool_response_start_token_id; // <|tool_response>
+  uint32_t      tool_response_end_token_id;   // <tool_response|>
 
-  uint32_t string_delimiter_token_id; // <|"|>
+  uint32_t      string_delimiter_token_id; // <|"|>
 
-  uint32_t image_start_token_id; //<|image>
-  uint32_t image_end_token_id;   //<image|>
-  uint32_t audio_start_token_id; // <|audio>
-  uint32_t audio_end_token_id;   // <audio|>
-  uint32_t image_placeholer_id;  // <|image|>
-  uint32_t audio_placeholder_id; // <|audio|>
+  uint32_t      image_start_token_id; //<|image>
+  uint32_t      image_end_token_id;   //<image|>
+  uint32_t      audio_start_token_id; // <|audio>
+  uint32_t      audio_end_token_id;   // <audio|>
+  uint32_t      image_placeholer_id;  // <|image|>
+  uint32_t      audio_placeholder_id; // <|audio|>
 } g4_tokenizer;
 
-static g4_tokenizer load_tokenizer(gguf *g) {
-  return NULL;
+static void tokenizer_free(g4_tokenizer *tok) {
+  free(tok->tokens);
+  table_free(&tok->token_to_id);
+  table_free(&tok->merge_rank);
+  memset(tok, 0, sizeof(*tok));
+}
+
+static int vocab_lookup(const g4_tokenizer *tok, const char *text) {
+  int token = -1;
+  if (!table_get(&tok->token_to_id, text, strlen(text), &token)) {
+    fprintf(stderr, "ds4: required tokenizer token is missing: %s\n", text);
+    exit(1);
+  }
+  return token;
+}
+
+static g4_tokenizer *load_tokenizer(gguf *g) {
+  g4_tokenizer *tok = (g4_tokenizer *)xcalloc(1, sizeof(*tok));
+
+  gguf_array    tokens;
+  gguf_array    merges;
+
+  if (!read_kv_array(g, "tokenizer.ggml.tokens", &tokens) || tokens.etype != GGUF_VALUE_STRING ||
+      tokens.len > INT32_MAX) {
+    fprintf(stderr, "Error: GGUF token table is missing or invalid\n");
+    exit(1);
+  }
+
+  if (!read_kv_array(g, "tokenizer.ggml.merges", &merges) || merges.etype != GGUF_VALUE_STRING) {
+    fprintf(stderr, "Error: GGUF merge table is missing or invalid\n");
+    exit(1);
+  }
+
+  tok->vocab_size = tokens.len;
+  tok->tokens     = xcalloc((size_t)tok->vocab_size, sizeof(gguf_str));
+  table_init(&tok->token_to_id, tokens.len);
+
+  g4_cursor c = cursor_at(g, tokens.data_pos);
+  // TODO: there must be a bettwe way cause this looks inefficient
+  for (uint32_t i = 0; i < tok->vocab_size; i++) {
+    if (!cursor_str(&c, &tok->tokens[i]))
+      g4_die(c.error);
+    table_put(&tok->token_to_id, tok->tokens[i], (int32_t)i);
+  }
+
+  table_init(&tok->merge_rank, merges.len);
+  c = cursor_at(g, merges.data_pos);
+  for (uint64_t i = 0; i < merges.len; i++) {
+    gguf_str merge;
+    if (!cursor_str(&c, &merge))
+      g4_die(c.error);
+    table_put(&tok->merge_rank, merge, (int32_t)i);
+  }
+
+  tok->bos_token_id                 = vocab_lookup(tok, "<bos>");
+  tok->eos_token_id                 = vocab_lookup(tok, "<eos>");
+  tok->unk_token_id                 = vocab_lookup(tok, "<unk>");
+  tok->system_token_id              = vocab_lookup(tok, "system");
+  tok->user_token_id                = vocab_lookup(tok, "user");
+  tok->model_token_id               = vocab_lookup(tok, "model");
+  tok->turn_start_token_id          = vocab_lookup(tok, "<|turn>");
+  tok->turn_end_token_id            = vocab_lookup(tok, "<turn|>");
+  tok->think_token_id               = vocab_lookup(tok, "<|think|>");
+  tok->channel_start_token_id       = vocab_lookup(tok, "<|channel>");
+  tok->channel_end_token_id         = vocab_lookup(tok, "<channel|>");
+  tok->tool_start_token_id          = vocab_lookup(tok, "<|tool>");
+  tok->tool_end_token_id            = vocab_lookup(tok, "<tool|>");
+  tok->tool_call_start_token_id     = vocab_lookup(tok, "<|tool_call>");
+  tok->tool_call_end_token_id       = vocab_lookup(tok, "<tool_call|>");
+  tok->tool_response_start_token_id = vocab_lookup(tok, "<|tool_response>");
+  tok->tool_response_end_token_id   = vocab_lookup(tok, "<tool_response|>");
+  tok->string_delimiter_token_id    = vocab_lookup(tok, "<|\"|>");
+  tok->image_start_token_id         = vocab_lookup(tok, "<|image>");
+  tok->image_end_token_id           = vocab_lookup(tok, "<image|>");
+  tok->audio_start_token_id         = vocab_lookup(tok, "<|audio>");
+  tok->audio_end_token_id           = vocab_lookup(tok, "<audio|>");
+  tok->image_placeholer_id          = vocab_lookup(tok, "<|image|>");
+  tok->audio_placeholder_id         = vocab_lookup(tok, "<|audio|>");
+
+  return tok;
 }
 static int g4_load(const char *model_dir) {
   gguf *g = gguf_open(model_dir);
