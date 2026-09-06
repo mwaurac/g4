@@ -754,7 +754,14 @@ static void bind_layer_weights(const g4_config *cfg, const gguf *g, g4_layer *la
   }
 }
 
-static void bind_weights(const g4_config *cfg, const gguf *g) {
+static void weights_free(g4_weights *weights) {
+  if (!weights)
+    return;
+  free(weights->layers);
+  free(weights);
+}
+
+static g4_weights *bind_weights(const g4_config *cfg, const gguf *g) {
   g4_weights *weights = calloc(1, sizeof(*weights));
   if (!weights) {
     fprintf(stderr, "Error: failed to allocate mem\n");
@@ -782,6 +789,8 @@ static void bind_weights(const g4_config *cfg, const gguf *g) {
   for (uint32_t i = 0; i < cfg->num_hidden_layers; i++) {
     bind_layer_weights(cfg, g, &weights->layers[i], i);
   }
+
+  return weights;
 }
 
 static g4_variant identify_model(const gguf *g) {
@@ -944,7 +953,7 @@ static void tokenizer_free(g4_tokenizer *tok) {
   memset(tok, 0, sizeof(*tok));
 }
 
-static int vocab_lookup(const g4_tokenizer *tok, const char *text) {
+static int table_lookup(const g4_tokenizer *tok, const char *text) {
   int token = -1;
   if (!table_get(&tok->token_to_id, text, strlen(text), &token)) {
     fprintf(stderr, "ds4: required tokenizer token is missing: %s\n", text);
@@ -991,34 +1000,287 @@ static g4_tokenizer *load_tokenizer(gguf *g) {
     table_put(&tok->merge_rank, merge, (int32_t)i);
   }
 
-  tok->bos_token_id                 = vocab_lookup(tok, "<bos>");
-  tok->eos_token_id                 = vocab_lookup(tok, "<eos>");
-  tok->unk_token_id                 = vocab_lookup(tok, "<unk>");
-  tok->system_token_id              = vocab_lookup(tok, "system");
-  tok->user_token_id                = vocab_lookup(tok, "user");
-  tok->model_token_id               = vocab_lookup(tok, "model");
-  tok->turn_start_token_id          = vocab_lookup(tok, "<|turn>");
-  tok->turn_end_token_id            = vocab_lookup(tok, "<turn|>");
-  tok->think_token_id               = vocab_lookup(tok, "<|think|>");
-  tok->channel_start_token_id       = vocab_lookup(tok, "<|channel>");
-  tok->channel_end_token_id         = vocab_lookup(tok, "<channel|>");
-  tok->tool_start_token_id          = vocab_lookup(tok, "<|tool>");
-  tok->tool_end_token_id            = vocab_lookup(tok, "<tool|>");
-  tok->tool_call_start_token_id     = vocab_lookup(tok, "<|tool_call>");
-  tok->tool_call_end_token_id       = vocab_lookup(tok, "<tool_call|>");
-  tok->tool_response_start_token_id = vocab_lookup(tok, "<|tool_response>");
-  tok->tool_response_end_token_id   = vocab_lookup(tok, "<tool_response|>");
-  tok->string_delimiter_token_id    = vocab_lookup(tok, "<|\"|>");
-  tok->image_start_token_id         = vocab_lookup(tok, "<|image>");
-  tok->image_end_token_id           = vocab_lookup(tok, "<image|>");
-  tok->audio_start_token_id         = vocab_lookup(tok, "<|audio>");
-  tok->audio_end_token_id           = vocab_lookup(tok, "<audio|>");
-  tok->image_placeholer_id          = vocab_lookup(tok, "<|image|>");
-  tok->audio_placeholder_id         = vocab_lookup(tok, "<|audio|>");
+  tok->bos_token_id                 = table_lookup(tok, "<bos>");
+  tok->eos_token_id                 = table_lookup(tok, "<eos>");
+  tok->unk_token_id                 = table_lookup(tok, "<unk>");
+  tok->system_token_id              = table_lookup(tok, "system");
+  tok->user_token_id                = table_lookup(tok, "user");
+  tok->model_token_id               = table_lookup(tok, "model");
+  tok->turn_start_token_id          = table_lookup(tok, "<|turn>");
+  tok->turn_end_token_id            = table_lookup(tok, "<turn|>");
+  tok->think_token_id               = table_lookup(tok, "<|think|>");
+  tok->channel_start_token_id       = table_lookup(tok, "<|channel>");
+  tok->channel_end_token_id         = table_lookup(tok, "<channel|>");
+  tok->tool_start_token_id          = table_lookup(tok, "<|tool>");
+  tok->tool_end_token_id            = table_lookup(tok, "<tool|>");
+  tok->tool_call_start_token_id     = table_lookup(tok, "<|tool_call>");
+  tok->tool_call_end_token_id       = table_lookup(tok, "<tool_call|>");
+  tok->tool_response_start_token_id = table_lookup(tok, "<|tool_response>");
+  tok->tool_response_end_token_id   = table_lookup(tok, "<tool_response|>");
+  tok->string_delimiter_token_id    = table_lookup(tok, "<|\"|>");
+  tok->image_start_token_id         = table_lookup(tok, "<|image>");
+  tok->image_end_token_id           = table_lookup(tok, "<image|>");
+  tok->audio_start_token_id         = table_lookup(tok, "<|audio>");
+  tok->audio_end_token_id           = table_lookup(tok, "<audio|>");
+  tok->image_placeholer_id          = table_lookup(tok, "<|image|>");
+  tok->audio_placeholder_id         = table_lookup(tok, "<|audio|>");
 
   return tok;
 }
-static int g4_load(const char *model_dir) {
+
+/* A dynamic byte buffer */
+typedef struct {
+  uint8_t *data;
+  uint64_t len;
+  uint64_t capacity;
+} byte_buf;
+
+static void bb_init(byte_buf *b) {
+  b->data     = NULL;
+  b->len      = 0;
+  b->capacity = 0;
+}
+
+static void bb_reserve(byte_buf *b, size_t extra) {
+  if (b->len + extra <= b->capacity)
+    return;
+  size_t new_cap = b->capacity ? b->capacity * 2 : 64;
+  while (new_cap < b->len + extra)
+    new_cap *= 2;
+  b->data     = (uint8_t *)realloc(b->data, new_cap);
+  b->capacity = new_cap;
+}
+
+static void bb_push(byte_buf *b, const uint8_t *bytes, size_t n) {
+  bb_reserve(b, n);
+  memcpy(b->data + b->len, bytes, n);
+  b->len += n;
+}
+
+static void bb_push_byte(byte_buf *b, uint8_t byte) {
+  bb_push(b, &byte, 1);
+}
+
+static void bb_free(byte_buf *b) {
+  free(b->data);
+  b->data     = NULL;
+  b->len      = 0;
+  b->capacity = 0;
+}
+
+typedef struct {
+  int32_t *data;
+  uint64_t len;
+  uint64_t capacity;
+} id_buf;
+
+static void ib_init(id_buf *b) {
+  b->data     = NULL;
+  b->len      = 0;
+  b->capacity = 0;
+}
+
+static void ib_push(id_buf *b, int32_t id) {
+  if (b->len == b->capacity) {
+    uint64_t new_cap = b->capacity ? b->capacity * 2 : 64;
+    b->data          = (int32_t *)realloc(b->data, new_cap * sizeof(int32_t));
+    b->capacity      = new_cap;
+  }
+  b->data[b->len++] = id;
+}
+
+static void ib_free(id_buf *b) {
+  free(b->data);
+  b->data     = NULL;
+  b->len      = 0;
+  b->capacity = 0;
+}
+
+#define SPACE_MARKER_BYTES "\xE2\x96\x81" /* U+2581 "▁" */
+static void normalize(const char *text, byte_buf *out) {
+  bb_init(out);
+  int starts_with_space = (text[0] == ' ');
+  if (!starts_with_space)
+    bb_push(out, (const uint8_t *)SPACE_MARKER_BYTES, 3);
+  for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+    if (*p == ' ')
+      bb_push(out, (const uint8_t *)SPACE_MARKER_BYTES, 3);
+    else
+      bb_push_byte(out, *p);
+  }
+}
+
+/*
+ * UTF-8 rune (codepoint byte-span) decoding
+ */
+
+typedef struct {
+  uint32_t start;
+  uint32_t len;
+} rune;
+
+static uint32_t utf8_rune_len(uint8_t lead) {
+  if ((lead & 0x80) == 0x00)
+    return 1;
+  if ((lead & 0xE0) == 0xC0)
+    return 2;
+  if ((lead & 0xF0) == 0xE0)
+    return 3;
+  if ((lead & 0xF8) == 0xF0)
+    return 4;
+  return 1; // invalid lead byte. treat as a single stray byte
+}
+
+static uint32_t decode_runes(const uint8_t *buf, uint32_t len, rune **out) {
+  uint32_t cap   = len + 1;
+  rune    *runes = (rune *)malloc(cap * sizeof(rune));
+  uint32_t count = 0;
+  uint32_t i     = 0;
+
+  while (i < len) {
+    uint32_t rl = utf8_rune_len(buf[i]);
+    if (i + rl > len)
+      rl = len - 1; // truncated sequence: take what's left
+    runes[count].start = i;
+    runes[count].len   = rl;
+    count++;
+    i += rl;
+  }
+  *out = runes;
+  return count;
+}
+
+typedef struct {
+  int32_t  vocab_id;
+  uint32_t byte_start;
+  uint32_t byte_len;
+} symbol;
+
+static int bpe_rank(const g4_tokenizer *tok, const uint8_t *base, const symbol *a, const symbol *b) {
+  uint64_t len = (uint64_t)a->byte_len + 1 + b->byte_len;
+  char     stack[512];
+  char    *buf = len <= sizeof(stack) ? stack : malloc((size_t)len);
+
+  memcpy(buf, base + a->byte_start, (size_t)a->byte_len);
+  buf[a->byte_len] = ' ';
+  memcpy(buf + a->byte_len + 1, base + b->byte_start, (size_t)b->byte_len);
+
+  int rank = -1;
+  table_get(&tok->merge_rank, buf, len, &rank);
+
+  if (buf != stack)
+    free(buf);
+  return rank;
+}
+
+static void bpe_merge_word(const g4_tokenizer *tok, const uint8_t *base, symbol *symbols, int *count) {
+  for (;;) {
+    int best_rank = INT32_MAX;
+    int best_idx  = -1;
+
+    for (int i = 0; i + 1 < *count; i++) {
+      if (symbols[i].vocab_id < 0 || symbols[i + 1].vocab_id < 0)
+        continue;
+      int rank = bpe_rank(tok, base, &symbols[i], &symbols[i + 1]);
+      if (rank >= 0 && rank < best_rank) {
+        best_rank = rank;
+        best_idx  = i;
+      }
+    }
+
+    if (best_idx == -1)
+      break; // no mergeable adjacent pair left: done
+
+    uint32_t merged_len = symbols[best_idx].byte_len + symbols[best_idx + 1].byte_len;
+    int      result_id;
+    if (!table_get(&tok->token_to_id, (const char *)(base + symbols[best_idx].byte_start), merged_len, &result_id)) {
+      break;
+    }
+
+    symbols[best_idx].vocab_id = result_id;
+    symbols[best_idx].byte_len = merged_len;
+    memmove(&symbols[best_idx + 1], &symbols[best_idx + 2], (size_t)(*count - best_idx - 2) * sizeof(symbol));
+    (*count)--;
+  }
+}
+
+static id_buf g4_encode(const g4_tokenizer *tok, const char *text, bool add_bos) {
+  byte_buf norm;
+  normalize(text, &norm);
+
+  rune    *runes;
+  uint32_t num_runes = decode_runes(norm.data, (uint32_t)norm.len, &runes);
+
+  id_buf   ids;
+  ib_init(&ids);
+  if (add_bos)
+    ib_push(&ids, (int32_t)tok->bos_token_id);
+
+  uint32_t word_start = 0;
+  for (uint32_t i = 0; i <= num_runes; i++) {
+    int is_marker =
+      (i < num_runes && runes[i].len == 3 && memcmp(norm.data + runes[i].start, SPACE_MARKER_BYTES, 3) == 0);
+    int word_len_so_far = (int)(i - word_start);
+    int at_end          = (i == num_runes);
+
+    if ((is_marker && word_len_so_far > 0) || at_end) {
+      int wcount = (int)(i - word_start);
+      if (wcount > 0) {
+        symbol *symbols = (symbol *)malloc((size_t)wcount * sizeof(symbol));
+        for (int k = 0; k < wcount; k++) {
+          rune r = runes[word_start + k];
+          int  id;
+          symbols[k].vocab_id   = table_get(&tok->token_to_id, (const char *)norm.data + r.start, r.len, &id) ? id : -1;
+          symbols[k].byte_start = r.start;
+          symbols[k].byte_len   = r.len;
+        }
+
+        int scount = wcount;
+        bpe_merge_word(tok, norm.data, symbols, &scount);
+
+        for (int k = 0; k < scount; k++) {
+          if (symbols[k].vocab_id >= 0) {
+            ib_push(&ids, symbols[k].vocab_id);
+          } else {
+            // byte fallback: format "<0xXX>" and look it up directly
+            for (uint32_t b = 0; b < symbols[k].byte_len; b++) {
+              uint8_t byte = norm.data[symbols[k].byte_start + b];
+              char    tag[8];
+              snprintf(tag, sizeof(tag), "<0x%02X>", byte);
+              int fb;
+              if (table_get(&tok->token_to_id, tag, strlen(tag), &fb))
+                ib_push(&ids, fb);
+              else
+                ib_push(&ids, (int32_t)tok->unk_token_id);
+            }
+          }
+        }
+        free(symbols);
+      }
+      word_start = i;
+    }
+  }
+
+  free(runes);
+  bb_free(&norm);
+  return ids;
+}
+
+static void print_ids(const g4_tokenizer *tok, const id_buf *ids) {
+  printf("[");
+  for (uint64_t i = 0; i < ids->len; i++) {
+    printf("%s%d", i ? ", " : "", ids->data[i]);
+  }
+  printf("]\npieces: [");
+  for (uint64_t i = 0; i < ids->len; i++) {
+    int32_t  id    = ids->data[i];
+    gguf_str piece = tok->tokens[id];
+    printf("%s\"%.*s\"", i ? ", " : "", (int)piece.len, piece.ptr);
+  }
+  printf("]\n");
+}
+
+static int g4_load(const char *model_dir, const char *prompt) {
   gguf *g = gguf_open(model_dir);
   if (!g) {
     fprintf(stderr, "Error: Failed to open GGUF file\n");
@@ -1048,10 +1310,15 @@ static int g4_load(const char *model_dir) {
     return 0;
   }
 
-  bind_weights(cfg, g);
+  g4_weights   *weights = bind_weights(cfg, g);
+  g4_tokenizer *tok     = load_tokenizer(g);
 
-  // TODO: Load tokenizer
-  load_tokenizer(g);
+  id_buf        ids = g4_encode(tok, prompt, true);
+  print_ids(tok, &ids);
+  ib_free(&ids);
+
+  tokenizer_free(tok);
+  weights_free(weights);
   gguf_close(g);
   return 1;
 }
@@ -1102,6 +1369,7 @@ static int init_cfg(int argc, char *argv[], cli_config *cfg) {
   }
   return 1;
 }
+
 int main(int argc, char *argv[]) {
   cli_config cfg;
 
@@ -1110,7 +1378,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  if (!g4_load(cfg.model_dir)) {
+  if (!g4_load(cfg.model_dir, cfg.prompt)) {
     fprintf(stderr, "Error: failed to load model\n");
     return 1;
   }
