@@ -29,6 +29,13 @@ static void *xcalloc(size_t n, size_t size) {
   return p;
 }
 
+static void *xmalloc(size_t size) {
+  void *p = malloc(size);
+  if (!p)
+    g4_die("out of mem");
+  return p;
+}
+
 enum {
   GGML_TYPE_F32     = 0,
   GGML_TYPE_F16     = 1,
@@ -1266,6 +1273,72 @@ static id_buf g4_encode(const g4_tokenizer *tok, const char *text, bool add_bos)
   return ids;
 }
 
+static int hexval(char c) {
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  return -1;
+}
+
+static int parse_byte_fallback(const char *ptr, uint64_t len) {
+  if (len != 6 || ptr[0] != '<' || ptr[1] != '0' || ptr[2] != 'x' || ptr[5] != '>')
+    return -1;
+  int hi = hexval(ptr[3]);
+  int lo = hexval(ptr[4]);
+  if (hi < 0 || lo < 0)
+    return -1;
+  return (hi << 4) | lo;
+}
+
+static char *g4_decode(const g4_tokenizer *tok, const int32_t *ids, uint64_t num_ids, bool skip_special) {
+  byte_buf raw;
+  bb_init(&raw);
+
+  for (uint64_t i = 0; i < num_ids; i++) {
+    int32_t id = ids[i];
+    if (id < 0 || (uint32_t)id >= tok->vocab_size)
+      continue;
+    if (skip_special &&
+        (id == (int32_t)tok->bos_token_id || id == (int32_t)tok->eos_token_id || id == (int32_t)tok->unk_token_id))
+      continue;
+
+    gguf_str piece    = tok->tokens[id];
+    int      byte_val = parse_byte_fallback(piece.ptr, piece.len);
+    if (byte_val >= 0) {
+      bb_push_byte(&raw, (uint8_t)byte_val);
+    } else {
+      bb_push(&raw, (const uint8_t *)piece.ptr, (size_t)piece.len);
+    }
+  }
+
+  // Replace every "▁" marker with a space
+  byte_buf out;
+  bb_init(&out);
+  uint64_t i = 0;
+  while (i < raw.len) {
+    if (i + 3 <= raw.len && memcmp(raw.data + i, SPACE_MARKER_BYTES, 3) == 0) {
+      bb_push_byte(&out, ' ');
+      i += 3;
+    } else {
+      bb_push_byte(&out, raw.data[i]);
+      i += 1;
+    }
+  }
+  bb_free(&raw);
+
+  // Undo the dummy prefix by dropping space at beginning
+  uint64_t start  = (out.len > 0 && out.data[0] == ' ') ? 1 : 0;
+  char    *result = (char *)xmalloc((size_t)(out.len - start) + 1);
+  memcpy(result, out.data + start, (size_t)(out.len - start));
+  result[out.len - start] = '\0';
+  bb_free(&out);
+
+  return result;
+}
+
 static void print_ids(const g4_tokenizer *tok, const id_buf *ids) {
   printf("[");
   for (uint64_t i = 0; i < ids->len; i++) {
@@ -1315,7 +1388,11 @@ static int g4_load(const char *model_dir, const char *prompt) {
 
   id_buf        ids = g4_encode(tok, prompt, true);
   print_ids(tok, &ids);
+
+  char *decoded = g4_decode(tok, ids.data, ids.len, /*skip_special=*/true);
+  printf("decoded: %s\n", decoded);
   ib_free(&ids);
+  free(decoded);
 
   tokenizer_free(tok);
   weights_free(weights);
