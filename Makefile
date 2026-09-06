@@ -2,7 +2,7 @@ CC ?= gcc
 TARGET ?= g4
 BUILD_DIR ?= build
 
-SRCS = main.c
+SRCS = main.c gguf.c quant.c tokenizer.c
 
 
 # flags
