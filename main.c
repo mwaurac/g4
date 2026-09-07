@@ -1,8 +1,10 @@
 #include "gguf.h"
-#include "tokenizer.h"
 #include "quant.h"
+#include "tokenizer.h"
 #include "util.h"
 
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -243,11 +245,7 @@ static void weights_free(g4_weights *weights) {
 }
 
 static g4_weights *bind_weights(const g4_config *cfg, const gguf *g) {
-  g4_weights *weights = calloc(1, sizeof(*weights));
-  if (!weights) {
-    fprintf(stderr, "Error: failed to allocate mem\n");
-    exit(1);
-  }
+  g4_weights *weights = xcalloc(1, sizeof(*weights));
 
   weights->token_embd  = required_tensor(g, "token_embd.weight");
   weights->output      = find_tensor(g, "output.weight");
@@ -261,11 +259,7 @@ static g4_weights *bind_weights(const g4_config *cfg, const gguf *g) {
     weights->per_layer_proj_norm  = find_tensor(g, "per_layer_proj_norm.weight");
   }
 
-  weights->layers = calloc(cfg->num_hidden_layers, sizeof(g4_layer));
-  if (!weights->layers) {
-    fprintf(stderr, "Error: Failed to allocate mem for layers\n");
-    exit(1);
-  }
+  weights->layers = xcalloc(cfg->num_hidden_layers, sizeof(g4_layer));
 
   for (uint32_t i = 0; i < cfg->num_hidden_layers; i++) {
     bind_layer_weights(cfg, g, &weights->layers[i], i);
@@ -312,18 +306,37 @@ static uint32_t g4_validate_config(const gguf *g, const g4_config *cfg) {
   return 1;
 }
 
-static int g4_load(const char *model_dir, const char *prompt) {
-  gguf *g = gguf_open(model_dir);
+typedef struct {
+  gguf            *g;
+  const g4_config *cfg;
+  g4_weights      *weights;
+  g4_tokenizer    *tok;
+} g4_ctx;
+
+static void g4_free(g4_ctx *ctx) {
+  if (!ctx)
+    return;
+  tokenizer_free(ctx->tok);
+  weights_free(ctx->weights);
+  gguf_close(ctx->g);
+  free(ctx);
+}
+static g4_ctx *g4_load(const char *model_dir, const char *prompt) {
+  g4_ctx *ctx = xcalloc(1, sizeof(*ctx));
+
+  gguf   *g = gguf_open(model_dir);
   if (!g) {
     fprintf(stderr, "Error: Failed to open GGUF file\n");
-    return 0;
+    free(ctx);
+    return NULL;
   }
 
   gguf_str arch;
   if (!read_kv_str(g, "general.architecture", &arch) || arch.len == 0) {
     fprintf(stderr, "Error: missing general.architecture\n");
     gguf_close(g);
-    return 0;
+    free(ctx);
+    return NULL;
   }
 
   g4_variant variant = identify_model(g);
@@ -331,38 +344,106 @@ static int g4_load(const char *model_dir, const char *prompt) {
   if (variant == G4_VARIANT_INVALID) {
     fprintf(stderr, "Error: unsupported Gemma 4 model\n");
     gguf_close(g);
-    return 0;
+    free(ctx);
+    return NULL;
   }
 
   const g4_config *cfg = &G4_CONFIGS[variant];
 
   if (!g4_validate_config(g, cfg)) {
-    fprintf(stderr, "Error: GGUF does not match expected config\n");
     gguf_close(g);
-    return 0;
+    free(ctx);
+    return NULL;
   }
 
   g4_weights   *weights = bind_weights(cfg, g);
   g4_tokenizer *tok     = load_tokenizer(g);
 
-  id_buf        ids = g4_encode(tok, prompt, true);
-  print_ids(tok, &ids);
+  // id_buf        ids = g4_encode(tok, prompt, true);
+  // print_ids(tok, &ids);
 
-  char *decoded = g4_decode(tok, ids.data, ids.len, true);
-  printf("decoded: %s\n", decoded);
-  ib_free(&ids);
-  free(decoded);
+  // char *decoded = g4_decode(tok, ids.data, ids.len, true);
+  // printf("decoded: %s\n", decoded);
+  // ib_free(&ids);
+  // free(decoded);
 
-  tokenizer_free(tok);
-  weights_free(weights);
-  gguf_close(g);
-  return 1;
+  ctx->cfg     = cfg;
+  ctx->g       = g;
+  ctx->tok     = tok;
+  ctx->weights = weights;
+
+  return ctx;
 }
 
 typedef struct {
   const char *model_dir;
   const char *prompt;
 } cli_config;
+
+#define MAX_INPUT_LEN 4096
+static volatile int g_interrupted = 0;
+
+static void         signal_handler(int sig) {
+  (void)sig;
+  g_interrupted = 1;
+}
+
+static char *g4_generate(g4_ctx *ctx, const char *prompt) {
+  (void)ctx;
+  (void)prompt;
+  // TODO: tokenize, forward and decode
+  return NULL;
+}
+
+static char *g4_chat(g4_ctx *ctx, const char *prompt) {
+  printf("Not in interactive chat\n");
+  // TODO: format the prompt then generate
+  return g4_generate(ctx, prompt);
+}
+
+static void run_interactive(g4_ctx *ctx) {
+  char input[MAX_INPUT_LEN];
+
+  printf("G4 chat. Commands: 'quit'\n");
+  while (true) {
+    printf("> ");
+    fflush(stdout);
+
+    g_interrupted = 0;
+    if (!fgets(input, MAX_INPUT_LEN, stdin)) {
+      if (g_interrupted) {
+        printf("\n");
+        continue;
+      }
+      printf("\n");
+      break;
+    }
+
+    size_t len = strlen(input);
+
+    // skip trailing newline
+    if (len > 0 && input[len - 1] == '\n') {
+      input[len - 1] = '\0';
+      len--;
+    }
+
+    // skip empty input
+    if (len == 0)
+      continue;
+
+    if (strcmp(input, "quit") == 0)
+      break;
+
+    char *response = g4_chat(ctx, input);
+    if (!response) {
+      fprintf(stderr, "Error: Generation failed\n");
+      continue;
+    }
+
+    printf("%s\n", response);
+    free(response);
+  }
+}
 
 static void usage() {
   fprintf(stderr, "Gemma4 E2B Inference\n");
@@ -372,51 +453,53 @@ static void usage() {
   fprintf(stderr, "-h, --help             Show this help message\n");
 }
 
-static int init_cfg(int argc, char *argv[], cli_config *cfg) {
+static void init_cfg(int argc, char *argv[], cli_config *cfg) {
   *cfg = (cli_config){0};
 
   for (int i = 1; i < argc; i++) {
     const char *arg = argv[i];
 
     if (strcmp(arg, "-m") == 0 || strcmp(arg, "--model") == 0) {
-      if (++i >= argc) {
-        fprintf(stderr, "Error: -m requires an argument\n");
-        return 0;
-      }
+      if (++i >= argc)
+        g4_die("-m requires an argument");
       cfg->model_dir = argv[i];
     } else if (strcmp(arg, "-p") == 0 || strcmp(arg, "--prompt") == 0) {
-      if (++i >= argc) {
-        fprintf(stderr, "Error: -p requires an argument\n");
-        return 0;
-      }
+      if (++i >= argc)
+        g4_die("-p requires an argument");
       cfg->prompt = argv[i];
     } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
       usage();
       exit(0);
     } else {
-      fprintf(stderr, "Error: Unknown option\n");
-      return 0;
+      usage();
+      g4_die("unknown option");
     }
   }
 
   if (!cfg->model_dir) {
-    fprintf(stderr, "Error: -m is required\n");
-    return 0;
+    usage();
+    g4_die("-m is required");
   }
-  return 1;
 }
 
 int main(int argc, char *argv[]) {
   cli_config cfg;
+  init_cfg(argc, argv, &cfg);
 
-  if (!init_cfg(argc, argv, &cfg)) {
-    usage();
-    return 1;
+  g4_ctx *ctx = g4_load(cfg.model_dir, cfg.prompt);
+  if (!ctx)
+    g4_die("failed to load model");
+
+  if (cfg.prompt) {
+    char *response = g4_chat(ctx, cfg.prompt);
+    if (response) {
+      printf("%s\n", response);
+      free(response);
+    }
+  } else {
+    run_interactive(ctx);
   }
 
-  if (!g4_load(cfg.model_dir, cfg.prompt)) {
-    fprintf(stderr, "Error: failed to load model\n");
-    return 1;
-  }
+  g4_free(ctx);
   return 0;
 }

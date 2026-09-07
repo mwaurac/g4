@@ -58,3 +58,8 @@ dkms.conf
 
 build/
 .idea/
+
+# perf profiling data
+perf.data
+perf.data.old
+perf.data.rc

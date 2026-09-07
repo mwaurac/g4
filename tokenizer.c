@@ -127,10 +127,12 @@ bool table_get(const str_i32_table *t, const char *ptr, uint64_t len, int *value
 }
 
 void tokenizer_free(g4_tokenizer *tok) {
+  if (!tok)
+    return;
   free(tok->tokens);
   table_free(&tok->token_to_id);
   table_free(&tok->merge_rank);
-  memset(tok, 0, sizeof(*tok));
+  free(tok);
 }
 
 static int table_lookup(const g4_tokenizer *tok, const char *text) {

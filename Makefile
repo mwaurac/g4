@@ -9,6 +9,7 @@ SRCS = main.c gguf.c quant.c tokenizer.c
 CFLAGS_BASE = -Wall -Wextra -Wpedantic -std=c11
 CFLAGS_RELEASE = -O3 -DNDEBUG
 CFLAGS_DEBUG   = -g -O0 -DDEBUG
+SANITIZE_DEBUG = -fsanitize=address
 
 # mode selection
 MODE ?= release
@@ -20,8 +21,10 @@ CFLAGS = $(CFLAGS_BASE)
 
 ifeq ($(MODE),release)
     CFLAGS += $(CFLAGS_RELEASE)
+    LDFLAGS =
 else ifeq ($(MODE),debug)
-    CFLAGS += $(CFLAGS_DEBUG)
+    CFLAGS += $(CFLAGS_DEBUG) $(SANITIZE_DEBUG)
+    LDFLAGS = $(SANITIZE_DEBUG)
 else
     $(error Unknown MODE '$(MODE)'. Valid modes: release, debug)
 endif
@@ -58,7 +61,3 @@ help:
 	@echo "  make debug      : Build with debug symbols"
 	@echo "  make run        : Build and run the current mode"
 	@echo "  make clean      : Remove all build artifacts"
-	@echo ""
-	@echo "Variables:"
-	@echo "  MODE=release|debug (or pass as a target)"
-	@echo "  CC=... TARGET=... BUILD_DIR=..."
