@@ -43,7 +43,7 @@ debug: $(BIN)
 
 $(BIN): $(OBJS)
 	@echo "Linking $(BIN) [$(MODE)]..."
-	$(CC) $(OBJS) -o $@ $(LDFLAGS)
+	$(CC) $(OBJS) -o $@ $(LDFLAGS) -lm
 
 $(BIN_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)

@@ -3,6 +3,7 @@
 #include "tokenizer.h"
 #include "util.h"
 
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -114,6 +115,7 @@ static const g4_config G4_CONFIGS[G4_VARIANT_COUNT] = {
     .name                        = "Gemma-4-31B-It",
     .context_length              = 262144,
     .num_hidden_layers           = 60,
+    .hidden_size                 = 3072,
     .intermediate_size           = 21504,
     .num_attention_heads         = 32,
     .num_key_value_heads         = 16,
@@ -359,20 +361,155 @@ static g4_ctx *g4_load(const char *model_dir, const char *prompt) {
   g4_weights   *weights = bind_weights(cfg, g);
   g4_tokenizer *tok     = load_tokenizer(g);
 
-  // id_buf        ids = g4_encode(tok, prompt, true);
-  // print_ids(tok, &ids);
-
-  // char *decoded = g4_decode(tok, ids.data, ids.len, true);
-  // printf("decoded: %s\n", decoded);
-  // ib_free(&ids);
-  // free(decoded);
-
   ctx->cfg     = cfg;
   ctx->g       = g;
   ctx->tok     = tok;
   ctx->weights = weights;
 
   return ctx;
+}
+
+typedef struct {
+  uint8_t *buffer;
+  size_t   capacity;
+  size_t   head;
+  size_t   peak_used;
+} g4_scratch;
+
+void scratch_init(g4_scratch *alloc, size_t capacity) {
+  // TODO: should be conditional on the avaliable architecture ie 32 for avx2 and 64 for avx-512
+  capacity      = (capacity + 63) & ~63;
+  alloc->buffer = (uint8_t *)aligned_alloc(64, capacity);
+  if (!alloc->buffer) {
+    fprintf(stderr, "Failed to allocate scratch buffer of %zu bytes\n", capacity);
+    exit(1);
+  }
+  alloc->capacity  = capacity;
+  alloc->head      = 0;
+  alloc->peak_used = 0;
+}
+
+static inline void scratch_reset(g4_scratch *alloc) {
+  alloc->head = 0;
+}
+
+static inline void *scratch_alloc(g4_scratch *alloc, size_t size) {
+  size_t aligned_size = (size + 63) & ~63;
+  size_t new_head     = alloc->head + aligned_size;
+
+  if (new_head > alloc->capacity) {
+    fprintf(stderr, "Scratch buffer overflow: need %zu, capacity %zu\n", new_head, alloc->capacity);
+    return NULL;
+  }
+
+  void *ptr   = alloc->buffer + alloc->head;
+  alloc->head = new_head;
+
+  if (alloc->head > alloc->peak_used) {
+    alloc->peak_used = alloc->head;
+  }
+
+  return ptr;
+}
+
+static inline void *scratch_calloc(g4_scratch *alloc, size_t size) {
+  void *ptr = scratch_alloc(alloc, size);
+  if (ptr)
+    memset(ptr, 0, size);
+  return ptr;
+}
+
+// get current high-water mark (for debugging)
+size_t scratch_peak_used(g4_scratch *alloc) {
+  return alloc->peak_used;
+}
+
+void scratch_free(g4_scratch *alloc) {
+  free(alloc->buffer);
+  alloc->buffer   = NULL;
+  alloc->capacity = 0;
+  alloc->head     = 0;
+}
+
+size_t calculate_max_scratch(g4_ctx *ctx, int T) {
+  const g4_config *cfg = ctx->cfg;
+
+  const size_t     H   = cfg->hidden_size;
+  const size_t     I   = cfg->intermediate_size;
+  const size_t     nh  = cfg->num_attention_heads;
+  const size_t     hd  = cfg->head_dim;
+  const size_t     E   = cfg->num_experts;
+  const size_t     K   = cfg->top_k_experts;
+  const size_t     fsz = sizeof(float);
+
+  size_t           attn_out = T * H * fsz;
+  size_t           q        = T * nh * hd * fsz;
+  size_t           kv       = 2 * T * cfg->num_key_value_heads * hd * fsz;
+  size_t           scores   = nh * T * fsz; /* worst case: win_len == T */
+  size_t           attn     = attn_out + q + kv + scores;
+
+  size_t           ple_proj = 0;
+  if (cfg->hidden_size_per_layer_input > 0) {
+    size_t epl = cfg->hidden_size_per_layer_input;
+    ple_proj   = 4 * T * epl * cfg->num_hidden_layers * fsz;
+  }
+
+  size_t ple = 0;
+  if (cfg->hidden_size_per_layer_input > 0) {
+    size_t epl = cfg->hidden_size_per_layer_input;
+    ple        = T * epl * fsz    /* gate */
+                 + T * H * fsz    /* pe_out */
+                 + T * epl * fsz; /* proj */
+  }
+
+  size_t gate_mult = cfg->use_double_wide_mlp ? 2 : 1;
+  size_t ffn       = T * (gate_mult + 1) * I * fsz /* gate+up */
+                     + T * H * fsz;                /* out */
+
+  size_t moe = 0;
+  if (E > 0) {
+    moe = T * E * fsz                   /* router */
+          + T * K * (sizeof(int) + fsz) /* routing ids+weights */
+          + 3 * T * H * fsz;            /* mlp_norm + mlp_out + moe_out */
+  }
+
+  size_t layer = ple_proj + attn + ple + (ffn > moe ? ffn : moe);
+
+  return layer;
+}
+
+static inline float f16_to_f32(uint16_t h) {
+
+  uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+  uint32_t exp  = (h >> 10) & 0x1f;
+  uint32_t mant = h & 0x03ff;
+  uint32_t bits;
+
+  if (exp == 0) {
+    if (mant == 0) {
+      bits = sign;
+    } else {
+      exp = 1;
+      while ((mant & 0x0400) == 0) {
+        mant <<= 1;
+        exp--;
+      }
+      mant &= 0x03ff;
+      bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+  } else if (exp == 31) {
+    bits = sign | 0x7f800000u | (mant << 13);
+  } else {
+    bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+  }
+
+  float f;
+  memcpy(&f, &bits, sizeof(f));
+  return f;
+}
+
+static const void *tensor_data(const gguf *g, const g4_tensor *t) {
+  return g->data + t->abs_offset;
 }
 
 typedef struct {
