@@ -512,6 +512,57 @@ static const void *tensor_data(const gguf *g, const g4_tensor *t) {
   return g->data + t->abs_offset;
 }
 
+static void embed_token(g4_ctx *ctx, int token, float *out) {
+
+  g4_tensor *te = ctx->weights->token_embd;
+  if (te->type != GGML_TYPE_Q8_0 || te->ndims != 2) {
+    g4_die("expected a 2D Q8_0 token embedding tensor");
+  }
+  if (token < 0 || (uint64_t)token >= te->dim[1]) {
+    g4_die("token id is outside the embedding table");
+  }
+
+  const uint64_t n      = te->dim[0];
+  const uint64_t blocks = (n + 31) / 32;
+  const uint8_t *row    = (const uint8_t *)tensor_data(ctx->g, te) + (uint64_t)token * blocks * 34;
+  for (uint64_t b = 0; b < blocks; b++) {
+    uint16_t scale_bits;
+    memcpy(&scale_bits, row + b * 34, sizeof(scale_bits));
+    const float    scale = f16_to_f32(scale_bits);
+    const int8_t  *qs    = (const int8_t *)(row + b * 34 + 2);
+    const uint64_t i0    = b * 32;
+    const uint64_t bn    = n - i0 < 32 ? n - i0 : 32;
+    for (uint64_t i = 0; i < bn; i++) {
+      out[i0 + i] = scale * (float)qs[i];
+    }
+  }
+}
+static void embed_prompt(g4_ctx *ctx, const id_buf *tokens, uint32_t hidden_size, float *out) {
+  for (int i = 0; i < tokens->len; i++) {
+    // TODO: add embedding scale
+    embed_token(ctx, tokens->data[i], out + (uint64_t)i * hidden_size);
+  }
+}
+
+void g4_forward(g4_ctx *ctx, id_buf *tokens, float *logits, uint32_t pos) {
+  const g4_config *cfg     = ctx->cfg;
+  const int        seq_len = tokens->len;
+
+  g4_scratch       scratch;
+  size_t           max_scratch = calculate_max_scratch(ctx, seq_len);
+  scratch_init(&scratch, max_scratch);
+
+  float *hidden   = xmalloc((size_t)seq_len * cfg->hidden_size * sizeof(float));
+  float *residual = xmalloc((size_t)seq_len * cfg->hidden_size * sizeof(float));
+  float *norm_out = xmalloc((size_t)seq_len * cfg->hidden_size * sizeof(float));
+
+  embed_prompt(ctx, tokens, cfg->hidden_size, hidden);
+
+  free(residual);
+  free(norm_out);
+  scratch_free(&scratch);
+}
+
 typedef struct {
   const char *model_dir;
   const char *prompt;
@@ -526,14 +577,30 @@ static void         signal_handler(int sig) {
 }
 
 static char *g4_generate(g4_ctx *ctx, const char *prompt) {
-  (void)ctx;
-  (void)prompt;
-  // TODO: tokenize, forward and decode
-  return NULL;
+  id_buf   ids = g4_encode(ctx->tok, prompt, true);
+
+  uint32_t n_past = 0;
+
+  uint32_t n_prompt = (uint32_t)ids.len;
+  if (n_prompt > 1) {
+    float *logits = xmalloc((size_t)ids.len * G4_VOCAB_SIZE * sizeof(float));
+    g4_forward(ctx, &ids, logits, 0);
+    printf("forward works\n");
+    n_past = n_prompt;
+
+    free(logits);
+
+    n_past++;
+  } else {
+    n_past = 1;
+  }
+
+  char *text = g4_decode(ctx->tok, ids.data, ids.len, true);
+  ib_free(&ids);
+  return text;
 }
 
 static char *g4_chat(g4_ctx *ctx, const char *prompt) {
-  printf("Not in interactive chat\n");
   // TODO: format the prompt then generate
   return g4_generate(ctx, prompt);
 }
