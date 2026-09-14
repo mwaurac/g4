@@ -43,7 +43,12 @@ typedef struct {
 } ggml_type_info;
 
 const ggml_type_info *tensor_type(uint32_t type);
-const char *tensor_type_name(uint32_t type);
-int tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes);
+const char           *tensor_type_name(uint32_t type);
+int                   tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes);
+
+typedef struct {
+  uint16_t d;
+  int8_t   qs[32];
+} block_q8_0;
 
 #endif

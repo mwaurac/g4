@@ -512,35 +512,35 @@ static const void *tensor_data(const gguf *g, const g4_tensor *t) {
   return g->data + t->abs_offset;
 }
 
-static void embed_token(g4_ctx *ctx, int token, float *out) {
-
-  g4_tensor *te = ctx->weights->token_embd;
-  if (te->type != GGML_TYPE_Q8_0 || te->ndims != 2) {
-    g4_die("expected a 2D Q8_0 token embedding tensor");
-  }
-  if (token < 0 || (uint64_t)token >= te->dim[1]) {
-    g4_die("token id is outside the embedding table");
-  }
-
-  const uint64_t n      = te->dim[0];
-  const uint64_t blocks = (n + 31) / 32;
-  const uint8_t *row    = (const uint8_t *)tensor_data(ctx->g, te) + (uint64_t)token * blocks * 34;
-  for (uint64_t b = 0; b < blocks; b++) {
-    uint16_t scale_bits;
-    memcpy(&scale_bits, row + b * 34, sizeof(scale_bits));
-    const float    scale = f16_to_f32(scale_bits);
-    const int8_t  *qs    = (const int8_t *)(row + b * 34 + 2);
-    const uint64_t i0    = b * 32;
-    const uint64_t bn    = n - i0 < 32 ? n - i0 : 32;
-    for (uint64_t i = 0; i < bn; i++) {
-      out[i0 + i] = scale * (float)qs[i];
+void dequant_row_q8_0(const block_q8_0 *blocks, float *out, int n, int num_blocks, float embd_scale) {
+  for (int b = 0; b < num_blocks; b++) {
+    const float    scale = f16_to_f32(blocks[b].d);
+    const uint64_t bn    = n - (b * 32) < 32 ? n - (b * 32) : 32;
+    for (int j = 0; j < bn; j++) {
+      out[b * 32 + j] = blocks[b].qs[j] * scale * embd_scale;
     }
   }
 }
-static void embed_prompt(g4_ctx *ctx, const id_buf *tokens, uint32_t hidden_size, float *out) {
-  for (int i = 0; i < tokens->len; i++) {
-    // TODO: add embedding scale
-    embed_token(ctx, tokens->data[i], out + (uint64_t)i * hidden_size);
+
+static void embed(gguf *g, g4_tensor *te, id_buf *tokens, float *out, float embd_scale) {
+  if (te->type != GGML_TYPE_Q8_0 || te->ndims != 2) {
+    g4_die("expected a 2D Q8_0 token embedding tensor");
+  }
+  const uint64_t    n          = te->dim[0];
+  const uint64_t    num_blocks = (n + 31) / 32;
+
+  const block_q8_0 *table = (const block_q8_0 *)tensor_data(g, te);
+
+  for (uint64_t i = 0; i < tokens->len; i++) {
+    int token = tokens->data[i];
+
+    if (token < 0 || (uint64_t)token >= te->dim[1]) {
+      g4_die("token id is outside the embedding table");
+    }
+
+    const block_q8_0 *row = table + (uint64_t)token * num_blocks;
+
+    dequant_row_q8_0(row, out, n, num_blocks, embd_scale);
   }
 }
 
@@ -552,11 +552,19 @@ void g4_forward(g4_ctx *ctx, id_buf *tokens, float *logits, uint32_t pos) {
   size_t           max_scratch = calculate_max_scratch(ctx, seq_len);
   scratch_init(&scratch, max_scratch);
 
-  float *hidden   = xmalloc((size_t)seq_len * cfg->hidden_size * sizeof(float));
-  float *residual = xmalloc((size_t)seq_len * cfg->hidden_size * sizeof(float));
-  float *norm_out = xmalloc((size_t)seq_len * cfg->hidden_size * sizeof(float));
+  float      *hidden   = xmalloc((size_t)seq_len * cfg->hidden_size * sizeof(float));
+  float      *residual = xmalloc((size_t)seq_len * cfg->hidden_size * sizeof(float));
+  float      *norm_out = xmalloc((size_t)seq_len * cfg->hidden_size * sizeof(float));
 
-  embed_prompt(ctx, tokens, cfg->hidden_size, hidden);
+  const float embd_scale = sqrtf((float)cfg->hidden_size);
+  embed(ctx->g, ctx->weights->token_embd, tokens, hidden, embd_scale);
+
+  if (cfg->hidden_size_per_layer_input > 0) {
+    float *ple_emb = xmalloc((size_t)seq_len * cfg->num_hidden_layers * cfg->hidden_size_per_layer_input);
+
+    float  ple_embd_scale = sqrtf((float)cfg->hidden_size_per_layer_input);
+    embed(ctx->g, ctx->weights->per_layer_token_embd, tokens, ple_emb, ple_embd_scale);
+  }
 
   free(residual);
   free(norm_out);
